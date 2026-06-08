@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources xmlns:tools="http://schemas.android.com/tools">
+    <!-- 改用系统原生 Material 主题（兼容 Compose，避免属性缺失） -->
+    <style name="Theme.LengKuBao" parent="android:Theme.Material.Light.NoActionBar">
+        <!-- 基础颜色（添加 android: 前缀，关键修复） -->
+        <item name="android:colorPrimary">@android:color/holo_blue_dark</item>
+        <item name="android:colorPrimaryDark">@android:color/holo_blue_light</item>
+        <item name="android:colorAccent">@android:color/holo_green_light</item>
+        <item name="android:windowBackground">@android:color/white</item>
+
+        <!-- 状态栏适配 -->
+        <item name="android:statusBarColor" tools:targetApi="23">@android:color/holo_blue_dark</item>
+        <item name="android:windowLightStatusBar" tools:targetApi="23">true</item>
+    </style>
+</resources>

@@ -1,0 +1,28 @@
+<resources>
+    <string name="app_name">冷库宝</string>
+    <string name="theme_lengkubao">LengKuBao Theme</string>
+    <!-- 打印相关字符串 -->
+    <string name="printer_status">打印机状态</string>
+    <string name="printer_not_connected">打印机未连接</string>
+    <string name="printer_ready">打印机已就绪</string>
+    <string name="printer_printing">打印中...</string>
+    <string name="printer_success">打印成功</string>
+    <string name="printer_error">打印失败</string>
+    <string name="printer_test">测试打印</string>
+    <string name="printer_refresh">刷新状态</string>
+    <string name="company_info">企业信息</string>
+    <string name="company_name">企业名称</string>
+    <string name="company_address">企业地址</string>
+    <string name="company_phone">联系电话</string>
+    <string name="print_settings">打印设置</string>
+    <string name="auto_cut">自动切纸</string>
+    <string name="paper_width">纸张宽度</string>
+    <string name="font_size">字体大小</string>
+    <string name="save_config">保存配置</string>
+    <string name="restore_defaults">恢复默认值</string>
+    <string name="config_saved">配置保存成功</string>
+    <string name="test_print_confirm">确认执行测试打印吗？</string>
+    <string name="save_config_confirm">确认保存所有打印配置吗？</string>
+    <string name="print_test_page">测试打印页</string>
+    <string name="print_system_name">冷库宝管理系统</string>
+</resources>

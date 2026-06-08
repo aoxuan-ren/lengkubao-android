@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:orientation="horizontal"
+    android:padding="12dp"
+    android:background="@drawable/border_bottom_light"> <!-- 你需要创建一个浅色底边框的drawable -->
+
+    <TextView
+        android:id="@+id/tvProductName"
+        android:layout_width="0dp"
+        android:layout_weight="1"
+        android:layout_height="wrap_content"
+        android:textSize="16sp"
+        android:text="商品名称"
+        android:textStyle="bold" />
+
+    <EditText
+        android:id="@+id/etQuantity"
+        android:layout_width="80dp"
+        android:layout_height="40dp"
+        android:inputType="number"
+        android:imeOptions="actionNext"
+        android:maxLines="1"
+        android:singleLine="true"
+        android:hint="0"
+        android:textSize="16sp"
+        android:gravity="center"
+        android:background="@drawable/edittext_border" /> <!-- 建议为输入框创建一个边框drawable -->
+
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="箱"
+        android:textSize="16sp"
+        android:layout_marginStart="8dp"
+        android:gravity="center_vertical" />
+
+</LinearLayout>

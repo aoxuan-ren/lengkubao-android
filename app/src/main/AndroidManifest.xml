@@ -1,0 +1,214 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools"
+    package="com.pingwei.lengkubao"
+    tools:ignore="CoarseFineLocation">
+
+    <!-- 基础权限 -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
+    <!-- 前台服务权限（TCP同步服务需要） -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <!-- Android 14+ 前台服务数据同步类型权限 -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.BLUETOOTH"
+        tools:ignore="CoarseFineLocation" />
+    <uses-permission android:name="android.permission.BLUETOOTH_ADMIN"
+        tools:ignore="CoarseFineLocation" />
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <!-- 相机权限（扫码功能） -->
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-feature android:name="android.hardware.camera" />
+
+    <!-- 存储权限（数据导出、数据库） -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+        android:maxSdkVersion="32" />
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"
+        android:maxSdkVersion="32" />
+
+    <!-- 商米设备专属权限 -->
+    <uses-permission android:name="com.sunmi.permission.PRINTER" />
+    <uses-permission android:name="android.permission.BLUETOOTH" />
+    <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" />
+    <!-- 新增：mDNS 多播权限 -->
+    <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
+    <!-- Android 11+ 特殊存储权限 -->
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE"
+        tools:ignore="ScopedStorage" />
+
+    <!-- 商米SDK强制要求：查询Sunmi服务包（包可见性声明） -->
+    <queries>
+        <package android:name="com.sunmi.tmservice"/>
+        <package android:name="com.sunmi.scanner"/>
+        <package android:name="com.sunmi.printer"/>
+        <package android:name="com.sunmi.peripheral"/>
+        <!-- 新增：针对Android 11+的包可见性声明（打印机服务） -->
+        <package android:name="woyou.aidlservice.jiuiv5" />
+        <package android:name="com.sunmi.scanner"/>
+    </queries>
+
+    <!-- 核心修改：将Application名称改为 .LengKuBaoApplication 统一全局单例 -->
+    <application
+        android:name=".LengKuBaoApplication"
+        android:allowBackup="true"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.LengKuBao"
+        android:requestLegacyExternalStorage="true"
+        tools:replace="android:theme">
+
+        <!-- 主界面 -->
+        <activity
+            android:name=".ui.main.MainActivity"
+            android:exported="true"
+            android:screenOrientation="portrait"
+            android:windowSoftInputMode="adjustResize">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- ========== 配置管理相关 ========== -->
+        <!-- 销售单查询相关Activity -->
+        <activity
+            android:name="com.pingwei.lengkubao.ui.query.saleout.SaleOutQueryActivity"
+            android:exported="false" />
+        <activity
+            android:name="com.pingwei.lengkubao.ui.query.saleout.SaleOutDetailActivity"
+            android:exported="false" />
+        <!-- 基础配置主页面 -->
+        <activity
+            android:name=".ui.config.ConfigMainActivity"
+            android:screenOrientation="portrait"
+            android:exported="false" />
+        <!-- 在 application 标签内，添加 CustomerEditActivity -->
+        <activity
+            android:name=".ui.customer.CustomerEditActivity"
+            android:exported="false"
+            android:theme="@style/Theme.LengKuBao" />
+
+        <!-- 打印配置 -->
+        <activity
+            android:name=".ui.config.PrintConfigActivity"
+            android:exported="false"
+            android:theme="@style/Theme.LengKuBao" />
+        <activity
+            android:name=".ui.customer.CustomerDetailActivity"
+            android:exported="false"
+            android:theme="@style/Theme.LengKuBao" />
+
+
+        <!-- TCP同步配置页面（新增） -->
+        <activity
+            android:name=".ui.sync.TcpSyncConfigActivity"
+            android:exported="false"
+            android:screenOrientation="portrait"/>
+
+        <!-- ========== 业务功能相关 ========== -->
+
+        <!-- 客户报账 -->
+        <activity
+            android:name=".ui.saleout.SaleOutActivity"
+            android:exported="false"
+            android:theme="@style/Theme.LengKuBao" />
+
+        <!-- 预售出库 -->
+        <activity
+            android:name=".ui.presale.PreSaleOutActivity"
+            android:exported="false"
+            android:screenOrientation="portrait" />
+        <activity
+            android:name=".ui.presale.PreSaleQueryActivity"
+            android:exported="false"
+            android:screenOrientation="portrait" />
+        <activity
+            android:name=".ui.presale.PreSaleDetailActivity"
+            android:exported="false"
+            android:screenOrientation="portrait" />
+
+        <!-- 买家列表 -->
+        <activity
+            android:name=".ui.customer.BuyerListActivity"
+            android:screenOrientation="portrait"
+            android:exported="false" />
+
+        <!-- 客户管理 -->
+        <activity
+            android:name=".ui.customer.CustomerAddActivity"
+            android:screenOrientation="portrait"
+            android:exported="false" />
+
+        <activity
+            android:name=".ui.customer.CustomerListActivity"
+            android:screenOrientation="portrait"
+            android:exported="false" />
+        <!-- 预支扣款 -->
+        <activity
+            android:name=".ui.advancededuction.AdvanceDeductionActivity"
+            android:exported="false" />
+        <!-- 入库开单 -->
+        <activity
+            android:name=".ui.instock.InStockActivity"
+            android:screenOrientation="portrait"
+            android:exported="false" />
+
+        <!-- 包装记账 -->
+        <activity
+            android:name=".ui.packaging.PackagingActivity"
+            android:exported="false" />
+        <!-- 入库统计 -->
+        <activity
+            android:name=".ui.statistics.InStockStatisticsActivity"
+            android:exported="false"
+            android:theme="@style/Theme.AppCompat.Light.DarkActionBar" />
+        <!-- ========== 单据查询相关 ========== -->
+
+        <!-- 入库单查询 -->
+        <activity
+            android:name=".ui.query.instock.InStockQueryActivity"
+            android:exported="false"
+            android:screenOrientation="portrait" />
+
+        <!-- 入库单详情 -->
+        <activity
+            android:name=".ui.query.instock.InStockDetailActivity"
+            android:label="入库单详情"
+            android:exported="false"
+            android:parentActivityName=".ui.query.instock.InStockQueryActivity" />
+
+        <!-- 包装单查询 -->
+        <activity
+            android:name=".ui.query.packaging.PackagingQueryActivity"
+            android:exported="false"
+            android:screenOrientation="portrait" />
+
+        <!-- 包装单详情 -->
+        <activity
+            android:name=".ui.query.packaging.PackagingDetailActivity"
+            android:label="包装单详情"
+            android:exported="false"
+            android:parentActivityName=".ui.query.packaging.PackagingQueryActivity" />
+
+
+
+        <!-- TCP同步服务（新增）- 前台服务，指定数据同步类型，适配Android 14+ -->
+        <service
+            android:name=".service.TcpSyncService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+
+
+        <!-- 兼容旧版商米设备/Android系统的Apache Http库 -->
+        <uses-library
+            android:name="org.apache.http.legacy"
+            android:required="false" />
+
+    </application>
+
+</manifest>
