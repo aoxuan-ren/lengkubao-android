@@ -48,7 +48,7 @@ class InStockVoidService(
                 // 使用 runBlocking 在事务中执行挂起函数
                 runBlocking {
                     // 4. 还原库存（入库单删除需要减少库存）
-                    if (!restoreStockInTransaction(items, bill.locationId, bill.locationName, bill.id, bill.billNo)) {
+                    if (!restoreStockInTransaction(items, bill, bill.locationId, bill.locationName, bill.id, bill.billNo)) {
                         Log.e(TAG, "❌ 库存还原失败，事务回滚")
                         throw Exception("库存还原失败")
                     }
@@ -81,6 +81,7 @@ class InStockVoidService(
      */
     private suspend fun restoreStockInTransaction(
         items: List<InStockItem>,
+        bill: InStockBill,
         locationId: Long,
         locationName: String,
         billId: Long,

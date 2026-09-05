@@ -6,13 +6,14 @@ import androidx.lifecycle.viewModelScope
 import com.pingwei.lengkubao.data.db.AppDatabase
 import com.pingwei.lengkubao.data.db.entity.PreSaleBill
 import com.pingwei.lengkubao.ui.query.QueryTimeRangeUtils
+import com.pingwei.lengkubao.utils.BillQuerySearchFilter
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 
 class PreSaleQueryViewModel(application: Application) : AndroidViewModel(application) {
-    private val database = AppDatabase.getInstance(application)
+    private val database by lazy { AppDatabase.getInstance(application.applicationContext) }
     private val _bills = MutableStateFlow<List<PreSaleBill>>(emptyList())
     val bills: StateFlow<List<PreSaleBill>> = _bills.asStateFlow()
     private val _isLoading = MutableStateFlow(false)
@@ -43,9 +44,12 @@ class PreSaleQueryViewModel(application: Application) : AndroidViewModel(applica
         val end = QueryTimeRangeUtils.getEndTime(label)
         return list.filter { bill ->
             bill.createTime in start..end &&
-                (searchText.isBlank() ||
-                    bill.billNo.contains(searchText, ignoreCase = true) ||
-                    bill.buyerName.contains(searchText, ignoreCase = true))
+                BillQuerySearchFilter.matches(
+                    keyword = searchText,
+                    billNo = bill.billNo,
+                    customerNo = bill.buyerNo,
+                    customerName = bill.buyerName
+                )
         }.sortedByDescending { it.createTime }
     }
 

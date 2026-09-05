@@ -8,8 +8,7 @@ import androidx.lifecycle.viewModelScope
 import com.pingwei.lengkubao.data.db.AppDatabase
 import com.pingwei.lengkubao.data.db.entity.SaleBill
 import com.pingwei.lengkubao.data.db.entity.SaleItem
-import com.pingwei.lengkubao.service.SaleOutVoidService // 新增导入
-import com.pingwei.lengkubao.service.StockService
+import com.pingwei.lengkubao.service.SaleOutVoidService
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -18,12 +17,10 @@ import kotlinx.coroutines.launch
 class SaleOutDetailViewModel(application: Application) : AndroidViewModel(application) {
     private val TAG = "SaleOutDetailVM"
     private val database by lazy { AppDatabase.getInstance(application.applicationContext) }
-    private val stockService by lazy { StockService(database.stockDao(), database.stockChangeDao()) }
-    private val voidService by lazy { // 新增：销售单删除服务
+    private val voidService by lazy {
         SaleOutVoidService(
             application.applicationContext,
-            database,
-            stockService
+            database
         )
     }
 
@@ -115,7 +112,7 @@ class SaleOutDetailViewModel(application: Application) : AndroidViewModel(applic
             val currentBill = _bill.value ?: return false
             database.saleBillDao().voidBill(currentBill.id) // 已在DAO中实现事务
             loadBill(currentBill.id) // 重新加载更新状态
-            _operationResult.value = OperationResult.Success("销售单已标记为作废", needRefresh = true)
+            _operationResult.value = OperationResult.Success("报账单已标记为作废", needRefresh = true)
             onDeleteSuccessCallback?.invoke() // 通知刷新
             true
         } catch (e: Exception) {
@@ -139,7 +136,7 @@ class SaleOutDetailViewModel(application: Application) : AndroidViewModel(applic
             if (result.isSuccess && result.getOrNull() == true) {
                 Log.d(TAG, "✅ 物理删除成功，库存已恢复")
                 clearData() // 清除当前数据
-                _operationResult.value = OperationResult.Success("销售单已物理删除，库存已恢复", needRefresh = true)
+                _operationResult.value = OperationResult.Success("报账单已物理删除，库存已恢复", needRefresh = true)
                 onDeleteSuccessCallback?.invoke() // 通知列表刷新
                 true
             } else {
@@ -157,19 +154,16 @@ class SaleOutDetailViewModel(application: Application) : AndroidViewModel(applic
         }
     }
 
-    // 打印销售单（更新打印状态，实际打印逻辑需结合打印服务）
-    suspend fun printBill(): Boolean {
+    // 打印成功后更新打印时间
+    suspend fun markPrinted(): Boolean {
         return try {
             val currentBill = _bill.value ?: return false
-            // 假设打印后更新打印时间（如果实体有printTime字段）
             val updatedBill = currentBill.copy(printTime = System.currentTimeMillis())
             database.saleBillDao().update(updatedBill)
-            loadBill(currentBill.id) // 重新加载更新状态
-            _operationResult.value = OperationResult.Success("打印状态已更新", needRefresh = true)
+            loadBill(currentBill.id)
             true
         } catch (e: Exception) {
-            Log.e(TAG, "打印销售单失败", e)
-            _operationResult.value = OperationResult.Error("打印失败: ${e.message}")
+            Log.e(TAG, "更新打印时间失败", e)
             false
         }
     }

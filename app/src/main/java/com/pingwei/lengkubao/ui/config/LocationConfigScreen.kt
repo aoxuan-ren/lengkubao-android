@@ -1,76 +1,69 @@
-// ui/config/LocationConfigScreen.kt (修复Material3版本)
 package com.pingwei.lengkubao.ui.config
 
 import android.app.Application
-import androidx.compose.foundation.background
+import android.widget.Toast
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
-import androidx.compose.ui.ExperimentalComposeUiApi
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.focus.FocusRequester
-import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalSoftwareKeyboardController
-import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.lifecycle.viewmodel.compose.viewModel
+import androidx.navigation.NavController
 import com.pingwei.lengkubao.data.db.AppDatabase
 import com.pingwei.lengkubao.data.db.entity.Location
+import com.pingwei.lengkubao.ui.common.rememberDismissKeyboard
+import com.pingwei.lengkubao.utils.ConfigDeleteResult
+import com.pingwei.lengkubao.utils.ConfigNameSearchFilter
+import com.pingwei.lengkubao.utils.PC_ONLY_CONFIG_DELETE_MESSAGE
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.flow.forEach
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
-@OptIn(ExperimentalMaterial3Api::class, ExperimentalComposeUiApi::class)
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun LocationConfigScreen(
-    onBack: () -> Unit = {}
+    navController: NavController,
+    snackbarHostState: SnackbarHostState,
 ) {
     val context = LocalContext.current
     val viewModel: LocationConfigViewModel = viewModel(
         factory = LocationConfigViewModelFactory(context.applicationContext as Application)
     )
-    val snackbarHostState = remember { SnackbarHostState() }
     val coroutineScope = rememberCoroutineScope()
 
-    // 监听视图模型状态
     val locations by viewModel.locations.collectAsState(initial = emptyList())
-    val searchResults by viewModel.searchResults.collectAsState(initial = emptyList())
     val isLoading by viewModel.isLoading.collectAsState()
-    val searchText by viewModel.searchText.collectAsState()
+    var searchQuery by remember { mutableStateOf("") }
 
-    // 控制对话框显示
-    var showAddDialog by remember { mutableStateOf(false) }
-    var showEditDialog by remember { mutableStateOf(false) }
     var showDeleteDialog by remember { mutableStateOf(false) }
     var selectedLocation by remember { mutableStateOf<Location?>(null) }
+    val dismissKeyboard = rememberDismissKeyboard()
+
+    val displayList = remember(locations, searchQuery) {
+        ConfigNameSearchFilter.filter(locations, searchQuery) { it.locationName }
+    }
 
     Scaffold(
         snackbarHost = { SnackbarHost(hostState = snackbarHostState) },
         topBar = {
             CenterAlignedTopAppBar(
                 title = { Text("库位管理") },
-                navigationIcon = {
-                    IconButton(onClick = onBack) {
-                        Icon(Icons.Filled.ArrowBack, "返回")
-                    }
-                },
                 actions = {
-                    // 只保留添加库位按钮，删除了初始化默认库位按钮
-                    IconButton(
-                        onClick = { showAddDialog = true }
-                    ) {
+                    IconButton(onClick = { navController.navigate("location_add") }) {
                         Icon(Icons.Filled.AddCircle, "添加库位")
                     }
                 }
@@ -86,37 +79,11 @@ fun LocationConfigScreen(
                 modifier = Modifier.fillMaxSize(),
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
-                // 搜索框
-                OutlinedTextField(
-                    value = searchText,
-                    onValueChange = { viewModel.searchLocations(it) },
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 16.dp, vertical = 8.dp),
-                    placeholder = { Text("搜索库位编号或名称...") },
-                    leadingIcon = { Icon(Icons.Filled.Search, "搜索") },
-                    trailingIcon = {
-                        if (searchText.isNotEmpty()) {
-                            IconButton(
-                                onClick = { viewModel.clearSearch() }
-                            ) {
-                                Icon(Icons.Filled.Clear, "清空")
-                            }
-                        }
-                    },
-                    singleLine = true,
-                    shape = MaterialTheme.shapes.medium,
-                    keyboardOptions = KeyboardOptions(
-                        imeAction = ImeAction.Search
-                    ),
-                    keyboardActions = KeyboardActions(
-                        onSearch = {
-                            // 搜索逻辑已经在onValueChange中处理
-                        }
-                    )
+                ConfigSearchBar(
+                    value = searchQuery,
+                    onValueChange = { searchQuery = it },
                 )
 
-                // 库位列表
                 if (isLoading) {
                     Box(
                         modifier = Modifier.fillMaxSize(),
@@ -125,8 +92,6 @@ fun LocationConfigScreen(
                         CircularProgressIndicator()
                     }
                 } else {
-                    val displayList = if (searchText.isNotEmpty()) searchResults else locations
-
                     if (displayList.isEmpty()) {
                         Box(
                             modifier = Modifier.fillMaxSize(),
@@ -142,7 +107,7 @@ fun LocationConfigScreen(
                                     modifier = Modifier.size(48.dp)
                                 )
                                 Text("暂无库位数据")
-                                if (searchText.isNotEmpty()) {
+                                if (searchQuery.isNotEmpty()) {
                                     Text("尝试其他关键词或清空搜索", style = MaterialTheme.typography.bodySmall)
                                 } else {
                                     Text("点击右上角 + 按钮添加库位", style = MaterialTheme.typography.bodySmall)
@@ -158,20 +123,20 @@ fun LocationConfigScreen(
                                 LocationItem(
                                     location = location,
                                     onEdit = {
-                                        selectedLocation = location
-                                        showEditDialog = true
+                                        dismissKeyboard()
+                                        navController.navigate("location_edit/${location.id}")
                                     },
                                     onDelete = {
+                                        dismissKeyboard()
                                         selectedLocation = location
                                         showDeleteDialog = true
                                     },
                                     onToggleEnabled = {
+                                        dismissKeyboard()
                                         coroutineScope.launch {
                                             viewModel.toggleLocationEnabled(location)
                                             val status = if (location.enabled) "禁用" else "启用"
-                                            snackbarHostState.showSnackbar(
-                                                "已${status} ${location.locationName}"
-                                            )
+                                            snackbarHostState.showSnackbar("已${status} ${location.locationName}")
                                         }
                                     }
                                 )
@@ -182,88 +147,200 @@ fun LocationConfigScreen(
             }
         }
 
-        // 添加库位对话框
-        if (showAddDialog) {
-            AddLocationDialog(
-                onDismiss = { showAddDialog = false },
-                onConfirm = { locationNo, locationName, description, capacity ->
-                    coroutineScope.launch {
-                        val success = viewModel.addLocation(
-                            locationNo = locationNo,
-                            locationName = locationName,
-                            description = description,
-                            capacity = capacity
-                        )
-                        if (success) {
-                            snackbarHostState.showSnackbar(
-                                "添加库位成功"
-                            )
-                        } else {
-                            snackbarHostState.showSnackbar(
-                                "库位编号已存在"
-                            )
-                        }
-                        showAddDialog = false
-                    }
-                }
-            )
-        }
-
-        // 编辑库位对话框
-        if (showEditDialog && selectedLocation != null) {
-            EditLocationDialog(
-                location = selectedLocation!!,
-                onDismiss = { showEditDialog = false },
-                onConfirm = { locationNo, locationName, description, capacity ->
-                    coroutineScope.launch {
-                        viewModel.updateLocation(
-                            location = selectedLocation!!.copy(
-                                locationNo = locationNo,
-                                locationName = locationName,
-                                description = description,
-                                capacity = capacity
-                            )
-                        )
-                        snackbarHostState.showSnackbar(
-                            "更新库位成功"
-                        )
-                        showEditDialog = false
-                    }
-                }
-            )
-        }
-
-        // 删除确认对话框
-        if (showDeleteDialog && selectedLocation != null) {
+    if (showDeleteDialog && selectedLocation != null) {
+            var refCount by remember(selectedLocation!!.id) { mutableIntStateOf(-1) }
+            LaunchedEffect(selectedLocation!!.id) {
+                refCount = viewModel.countLocationBillRefs(selectedLocation!!.id)
+            }
+            val location = selectedLocation!!
             AlertDialog(
-                onDismissRequest = { showDeleteDialog = false },
+                onDismissRequest = {
+                    showDeleteDialog = false
+                    selectedLocation = null
+                },
                 title = { Text("确认删除") },
                 text = {
-                    Text("确定要删除库位 ${selectedLocation!!.locationName} (${selectedLocation!!.locationNo}) 吗？此操作不可恢复。")
+                    when {
+                        refCount < 0 -> Text("正在检查单据引用…")
+                        refCount > 0 -> Text(
+                            "库位 ${location.locationName} 已被 $refCount 条单据引用，无法物理删除。确认后将停用。"
+                        )
+                        else -> Text("确定永久删除库位 ${location.locationName}？此操作不可恢复。")
+                    }
                 },
                 confirmButton = {
                     TextButton(
                         onClick = {
+                            if (refCount < 0) return@TextButton
                             coroutineScope.launch {
-                                viewModel.deleteLocation(selectedLocation!!)
-                                snackbarHostState.showSnackbar(
-                                    "删除库位成功"
-                                )
+                                val result = viewModel.deleteLocation(location)
                                 showDeleteDialog = false
+                                selectedLocation = null
+                                when (result) {
+                                    is ConfigDeleteResult.PcOnly ->
+                                        snackbarHostState.showSnackbar(PC_ONLY_CONFIG_DELETE_MESSAGE)
+                                    is ConfigDeleteResult.PhysicallyDeleted ->
+                                        snackbarHostState.showSnackbar("已永久删除")
+                                    is ConfigDeleteResult.DisabledDueToReferences ->
+                                        snackbarHostState.showSnackbar(
+                                            "已被单据引用，无法物理删除，已停用"
+                                        )
+                                    is ConfigDeleteResult.Failed ->
+                                        snackbarHostState.showSnackbar(result.message)
+                                }
                             }
-                        }
+                        },
+                        enabled = refCount >= 0,
                     ) {
-                        Text("删除")
+                        Text("删除", color = MaterialTheme.colorScheme.error)
                     }
                 },
                 dismissButton = {
-                    TextButton(
-                        onClick = { showDeleteDialog = false }
-                    ) {
+                    TextButton(onClick = {
+                        showDeleteDialog = false
+                        selectedLocation = null
+                    }) {
                         Text("取消")
                     }
+                },
+            )
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun LocationFormScreen(
+    locationId: Long?,
+    onSaved: () -> Unit,
+) {
+    val context = LocalContext.current
+    val coroutineScope = rememberCoroutineScope()
+    val viewModel: LocationConfigViewModel = viewModel(
+        factory = LocationConfigViewModelFactory(context.applicationContext as Application)
+    )
+    val isEditMode = locationId != null
+
+    var locationName by remember { mutableStateOf("") }
+    var description by remember { mutableStateOf("") }
+    var capacity by remember { mutableStateOf("0") }
+    var isNameError by remember { mutableStateOf(false) }
+    var isLoading by remember { mutableStateOf(isEditMode) }
+    var isSaving by remember { mutableStateOf(false) }
+
+    LaunchedEffect(locationId) {
+        if (isEditMode && locationId != null) {
+            isLoading = true
+            val location = withContext(Dispatchers.IO) {
+                AppDatabase.getInstance(context).locationDao().getLocationById(locationId)
+            }
+            if (location != null) {
+                locationName = location.locationName
+                description = location.description
+                capacity = location.capacity.toString()
+            }
+            isLoading = false
+        }
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .padding(16.dp),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        Text(
+            text = if (isEditMode) "编辑库位" else "添加库位",
+            fontSize = 24.sp,
+            fontWeight = FontWeight.Bold,
+            modifier = Modifier.padding(bottom = 24.dp)
+        )
+
+        if (isLoading) {
+            CircularProgressIndicator()
+        } else {
+            OutlinedTextField(
+                value = locationName,
+                onValueChange = {
+                    locationName = it
+                    isNameError = false
+                },
+                modifier = Modifier.fillMaxWidth().padding(bottom = 12.dp),
+                label = { Text("库位名称 *") },
+                placeholder = { Text("如: 东1库") },
+                singleLine = true,
+                isError = isNameError,
+                supportingText = {
+                    if (isNameError) Text("库位名称不能为空")
                 }
             )
+            if (isEditMode) {
+                OutlinedTextField(
+                    value = description,
+                    onValueChange = { description = it },
+                    modifier = Modifier.fillMaxWidth().padding(bottom = 12.dp),
+                    label = { Text("描述") },
+                    maxLines = 3
+                )
+                OutlinedTextField(
+                    value = capacity,
+                    onValueChange = {
+                        if (it.all { char -> char.isDigit() }) capacity = it
+                    },
+                    modifier = Modifier.fillMaxWidth().padding(bottom = 24.dp),
+                    label = { Text("容量限制") },
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number)
+                )
+            }
+        }
+
+        Button(
+            onClick = {
+                if (isSaving) return@Button
+                val nameValid = locationName.isNotBlank()
+                isNameError = !nameValid
+                if (!nameValid) return@Button
+                isSaving = true
+                coroutineScope.launch {
+                    if (isEditMode) {
+                        val existing = withContext(Dispatchers.IO) {
+                            AppDatabase.getInstance(context).locationDao().getLocationById(locationId!!)
+                        }
+                        if (existing != null) {
+                            viewModel.updateLocation(
+                                existing.copy(
+                                    locationName = locationName.trim(),
+                                    description = description.trim(),
+                                    capacity = capacity.toIntOrNull() ?: 0
+                                )
+                            )
+                            Toast.makeText(context, "更新库位成功", Toast.LENGTH_SHORT).show()
+                            onSaved()
+                        } else {
+                            isSaving = false
+                        }
+                    } else {
+                        val success = viewModel.addLocation(
+                            locationName = locationName.trim(),
+                            description = "",
+                            capacity = 0
+                        )
+                        if (success) {
+                            Toast.makeText(context, "添加库位成功", Toast.LENGTH_SHORT).show()
+                            onSaved()
+                        } else {
+                            Toast.makeText(context, "库位名称已存在", Toast.LENGTH_SHORT).show()
+                            isSaving = false
+                        }
+                    }
+                }
+            },
+            modifier = Modifier.fillMaxWidth(),
+            enabled = !isLoading && !isSaving
+        ) {
+            Text(if (isSaving) "正在保存..." else if (isEditMode) "保存" else "添加")
         }
     }
 }
@@ -293,15 +370,13 @@ fun LocationItem(
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Column(
-                modifier = Modifier.weight(1f)
-            ) {
+            Column(modifier = Modifier.weight(1f)) {
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
                     Text(
-                        location.locationNo,
+                        location.locationName,
                         style = MaterialTheme.typography.titleMedium,
                         color = MaterialTheme.colorScheme.primary
                     )
@@ -319,10 +394,6 @@ fun LocationItem(
                         }
                     }
                 }
-                Text(
-                    location.locationName,
-                    style = MaterialTheme.typography.bodyMedium
-                )
                 if (location.description.isNotEmpty()) {
                     Text(
                         location.description,
@@ -339,14 +410,8 @@ fun LocationItem(
                     )
                 }
             }
-
-            Row(
-                horizontalArrangement = Arrangement.spacedBy(4.dp)
-            ) {
-                IconButton(
-                    onClick = onToggleEnabled,
-                    modifier = Modifier.size(36.dp)
-                ) {
+            Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                IconButton(onClick = onToggleEnabled, modifier = Modifier.size(36.dp)) {
                     Icon(
                         if (location.enabled) Icons.Filled.ToggleOn else Icons.Filled.ToggleOff,
                         contentDescription = if (location.enabled) "禁用" else "启用",
@@ -354,10 +419,7 @@ fun LocationItem(
                         else MaterialTheme.colorScheme.outline
                     )
                 }
-                IconButton(
-                    onClick = onDelete,
-                    modifier = Modifier.size(36.dp)
-                ) {
+                IconButton(onClick = onDelete, modifier = Modifier.size(36.dp)) {
                     Icon(
                         Icons.Filled.Delete,
                         contentDescription = "删除",
@@ -367,246 +429,4 @@ fun LocationItem(
             }
         }
     }
-}
-
-@Composable
-fun AddLocationDialog(
-    onDismiss: () -> Unit,
-    onConfirm: (String, String, String, Int) -> Unit
-) {
-    val context = LocalContext.current
-    val coroutineScope = rememberCoroutineScope()
-
-    var locationNo by remember { mutableStateOf("") }
-    var locationName by remember { mutableStateOf("") }
-    var isNameError by remember { mutableStateOf(false) }
-    val hasGeneratedNo = remember { mutableStateOf(false) }
-
-    val keyboardController = LocalSoftwareKeyboardController.current
-    val focusRequester = remember { FocusRequester() }
-
-    // 自动生成库位编号
-    LaunchedEffect(Unit) {
-        if (!hasGeneratedNo.value) {
-            // 在后台线程执行数据库操作
-            val newNo = withContext(Dispatchers.IO) {
-                try {
-                    val db = com.pingwei.lengkubao.data.db.AppDatabase.getInstance(context)
-                    // 使用同步方法获取库位列表
-                    val allLocations = db.locationDao().getAllSimple()
-
-                    // 找出最大的编号数字
-                    var maxNumber = 0
-                    val pattern = Regex("""LC(\d+)""")
-
-                    if (allLocations.isNotEmpty()) {
-                        allLocations.forEach { loc ->
-                            val matchResult = pattern.find(loc.locationNo)
-                            if (matchResult != null) {
-                                val number = matchResult.groupValues[1].toIntOrNull() ?: 0
-                                if (number > maxNumber) {
-                                    maxNumber = number
-                                }
-                            }
-                        }
-                    }
-
-                    // 生成新的编号（LC + 两位数字，从01开始）
-                    val newNumber = maxNumber + 1
-                    "LC${String.format("%02d", newNumber)}"
-                } catch (e: Exception) {
-                    e.printStackTrace()
-                    "LC01"
-                }
-            }
-
-            locationNo = newNo
-            hasGeneratedNo.value = true
-        }
-    }
-
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("添加库位") },
-        text = {
-            Column(
-                verticalArrangement = Arrangement.spacedBy(12.dp)
-            ) {
-                // 库位编号 - 自动生成，只读显示
-                OutlinedTextField(
-                    value = locationNo,
-                    onValueChange = {},
-                    modifier = Modifier.fillMaxWidth(),
-                    label = { Text("库位编号（自动生成）") },
-                    enabled = false,
-                    colors = TextFieldDefaults.colors(
-                        disabledTextColor = MaterialTheme.colorScheme.primary,
-                        disabledContainerColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.5f),
-                        disabledLabelColor = MaterialTheme.colorScheme.primary
-                    )
-                )
-
-                // 库位名称 - 唯一需要填写的
-                OutlinedTextField(
-                    value = locationName,
-                    onValueChange = {
-                        locationName = it
-                        isNameError = false
-                    },
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .focusRequester(focusRequester),
-                    label = { Text("库位名称 *") },
-                    placeholder = { Text("如: 东1库") },
-                    singleLine = true,
-                    isError = isNameError,
-                    supportingText = {
-                        if (isNameError) {
-                            Text("库位名称不能为空")
-                        }
-                    }
-                )
-            }
-        },
-        confirmButton = {
-            TextButton(
-                onClick = {
-                    val nameValid = locationName.isNotBlank()
-                    isNameError = !nameValid
-
-                    if (nameValid) {
-                        keyboardController?.hide()
-                        onConfirm(
-                            locationNo,  // 使用自动生成的编号
-                            locationName.trim(),
-                            "",  // 描述传空
-                            0    // 容量传空
-                        )
-                        onDismiss() // 添加这一行，关闭对话框
-                    }
-                }
-            ) {
-                Text("添加")
-            }
-        },
-        dismissButton = {
-            TextButton(onClick = onDismiss) {
-                Text("取消")
-            }
-        }
-    )
-
-    LaunchedEffect(Unit) {
-        focusRequester.requestFocus()
-    }
-}
-
-@Composable
-fun EditLocationDialog(
-    location: Location,
-    onDismiss: () -> Unit,
-    onConfirm: (String, String, String, Int) -> Unit
-) {
-    var locationNo by remember { mutableStateOf(location.locationNo) }
-    var locationName by remember { mutableStateOf(location.locationName) }
-    var description by remember { mutableStateOf(location.description) }
-    var capacity by remember { mutableStateOf(location.capacity.toString()) }
-    var isNoError by remember { mutableStateOf(false) }
-    var isNameError by remember { mutableStateOf(false) }
-    val keyboardController = LocalSoftwareKeyboardController.current
-
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("编辑库位") },
-        text = {
-            Column(
-                verticalArrangement = Arrangement.spacedBy(12.dp)
-            ) {
-                OutlinedTextField(
-                    value = locationNo,
-                    onValueChange = {
-                        locationNo = it
-                        isNoError = false
-                    },
-                    modifier = Modifier.fillMaxWidth(),
-                    label = { Text("库位编号 *") },
-                    singleLine = true,
-                    isError = isNoError,
-                    supportingText = {
-                        if (isNoError) {
-                            Text("库位编号不能为空")
-                        }
-                    }
-                )
-
-                OutlinedTextField(
-                    value = locationName,
-                    onValueChange = {
-                        locationName = it
-                        isNameError = false
-                    },
-                    modifier = Modifier.fillMaxWidth(),
-                    label = { Text("库位名称 *") },
-                    singleLine = true,
-                    isError = isNameError,
-                    supportingText = {
-                        if (isNameError) {
-                            Text("库位名称不能为空")
-                        }
-                    }
-                )
-
-                OutlinedTextField(
-                    value = description,
-                    onValueChange = { description = it },
-                    modifier = Modifier.fillMaxWidth(),
-                    label = { Text("描述") },
-                    singleLine = false,
-                    maxLines = 3
-                )
-
-                OutlinedTextField(
-                    value = capacity,
-                    onValueChange = {
-                        if (it.all { char -> char.isDigit() }) {
-                            capacity = it
-                        }
-                    },
-                    modifier = Modifier.fillMaxWidth(),
-                    label = { Text("容量限制") },
-                    singleLine = true,
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number)
-                )
-            }
-        },
-        confirmButton = {
-            TextButton(
-                onClick = {
-                    // 验证输入
-                    val noValid = locationNo.isNotBlank()
-                    val nameValid = locationName.isNotBlank()
-
-                    isNoError = !noValid
-                    isNameError = !nameValid
-
-                    if (noValid && nameValid) {
-                        keyboardController?.hide()
-                        onConfirm(
-                            locationNo.trim(),
-                            locationName.trim(),
-                            description.trim(),
-                            capacity.toIntOrNull() ?: 0
-                        )
-                    }
-                }
-            ) {
-                Text("保存")
-            }
-        },
-        dismissButton = {
-            TextButton(onClick = onDismiss) {
-                Text("取消")
-            }
-        }
-    )
 }

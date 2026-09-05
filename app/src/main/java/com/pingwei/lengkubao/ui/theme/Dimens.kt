@@ -8,14 +8,14 @@ object AppDimens {
     val itemSpacing = 6.dp
     val sectionSpacing = 10.dp
     val buttonHeight = 44.dp
-    /** 可搜索输入框高度：按钮高度 + 约一行文字，保证占位/输入文字完整显示 */
-    val searchFieldHeight = buttonHeight + 24.dp
+    /** 可搜索输入框最小高度：容纳标签、图标与一行完整文字 */
+    val searchFieldHeight = 76.dp
     val iconLarge = 22.dp
     val iconMedium = 20.dp
     /** 首页功能入口图标与文字 */
-    val homeActionIconSize = 36.dp
+    val homeActionIconSize = 32.dp
     val homeQueryIconSize = 28.dp
     val homeQueryButtonHeight = 52.dp
-    val actionTileHeight = 60.dp
+    val actionTileHeight = 56.dp
     val dialogListMaxHeight = 240.dp
 }

@@ -13,3 +13,19 @@
 .externalNativeBuild
 .cxx
 local.properties
+
+# 构建产物、签名与业务数据（勿上传 GitHub）
+*.apk
+*.aab
+*.ap_
+*.jks
+*.keystore
+*.db
+*.db-shm
+*.db-wal
+app/release/
+*.xlsx
+*.xls
+.cursor/
+.kotlin/
+debug-*.log

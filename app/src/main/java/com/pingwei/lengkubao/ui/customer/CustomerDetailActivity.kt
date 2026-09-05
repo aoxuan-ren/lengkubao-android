@@ -87,30 +87,11 @@ fun CustomerDetailScreen(
 
     // 新增：删除客户函数（含二维码文件删除+数据库删除）
     fun deleteCustomer() {
-        val currentCustomer = customer ?: return
-
-        coroutineScope.launch(Dispatchers.IO) {
-            try {
-                val customerDao = LengKuBaoApplication.getDatabase().customerDao()
-
-                // 删除二维码文件（如果存在）
-                currentCustomer.qrCodePath?.let { path ->
-                    QRCodeGenerator.deleteQRCodeFile(path)
-                }
-
-                // 删除数据库记录
-                customerDao.delete(currentCustomer)
-
-                withContext(Dispatchers.Main) {
-                    Toast.makeText(context, "客户已删除", Toast.LENGTH_SHORT).show()
-                    onBackPressed() // 删除成功后返回上一页
-                }
-            } catch (e: Exception) {
-                withContext(Dispatchers.Main) {
-                    Toast.makeText(context, "删除失败: ${e.message}", Toast.LENGTH_SHORT).show()
-                }
-            }
-        }
+        Toast.makeText(
+            context,
+            com.pingwei.lengkubao.utils.PC_ONLY_CONFIG_DELETE_MESSAGE,
+            Toast.LENGTH_LONG
+        ).show()
     }
 
     // 新增：编辑客户函数 - 跳转到编辑界面

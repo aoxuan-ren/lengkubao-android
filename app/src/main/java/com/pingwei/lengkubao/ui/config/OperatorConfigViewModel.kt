@@ -1,31 +1,30 @@
-// ui/config/OperatorConfigViewModel.kt
 package com.pingwei.lengkubao.ui.config
 
 import android.app.Application
+import android.content.Context
 import androidx.lifecycle.*
 import com.pingwei.lengkubao.data.db.AppDatabase
 import com.pingwei.lengkubao.data.db.dao.OperatorDao
 import com.pingwei.lengkubao.data.db.entity.Operator
+import com.pingwei.lengkubao.utils.ConfigDeleteResult
+import com.pingwei.lengkubao.utils.ConfigDeleteService
+import com.pingwei.lengkubao.utils.SyncTrigger
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 
 class OperatorConfigViewModel(application: Application) : AndroidViewModel(application) {
 
     private val operatorDao: OperatorDao
-    private val _searchText = MutableStateFlow("")
+    private val appContext = application.applicationContext
     private val _operators = MutableStateFlow<List<Operator>>(emptyList())
-    private val _searchResults = MutableStateFlow<List<Operator>>(emptyList())
     private val _isLoading = MutableStateFlow(false)
 
-    val searchText: StateFlow<String> = _searchText.asStateFlow()
     val operators: StateFlow<List<Operator>> = _operators.asStateFlow()
-    val searchResults: StateFlow<List<Operator>> = _searchResults.asStateFlow()
     val isLoading: StateFlow<Boolean> = _isLoading.asStateFlow()
 
     init {
         operatorDao = AppDatabase.getInstance(application).operatorDao()
         loadOperators()
-        setupSearch()
     }
 
     private fun loadOperators() {
@@ -44,74 +43,58 @@ class OperatorConfigViewModel(application: Application) : AndroidViewModel(appli
         }
     }
 
-    private fun setupSearch() {
-        viewModelScope.launch {
-            _searchText
-                .debounce(300)
-                .distinctUntilChanged()
-                .collect { query ->
-                    if (query.isBlank()) {
-                        _searchResults.value = emptyList()
-                    } else {
-                        operatorDao.searchOperators(query)
-                            .collect { results ->
-                                _searchResults.value = results
-                            }
-                    }
-                }
-        }
-    }
-
-    fun searchOperators(query: String) {
-        _searchText.value = query
-    }
-
-    fun clearSearch() {
-        _searchText.value = ""
+    suspend fun countOperatorBillRefs(operatorId: Long): Int {
+        return ConfigDeleteService.countOperatorBillRefs(appContext, operatorId)
     }
 
     suspend fun addOperator(
-        operatorNo: String,
         name: String,
         phone: String = "",
         role: String = "操作员",
-        remark: String = ""
+        remark: String = "",
     ): Boolean {
-        // 检查编号是否已存在
-        val exists = operatorDao.countByOperatorNo(operatorNo) > 0
-        if (exists) {
-            return false
-        }
+        val trimmedName = name.trim()
+        if (trimmedName.isBlank()) return false
+        if (operatorDao.countByName(trimmedName) > 0) return false
 
         val operator = Operator(
-            operatorNo = operatorNo,
-            name = name,
+            name = trimmedName,
             phone = phone,
             role = role,
             remark = remark,
-            enabled = true
+            enabled = true,
         )
 
-        operatorDao.insert(operator)
+        val id = operatorDao.insert(operator)
+        SyncTrigger.triggerOperatorSync(appContext, id)
         return true
     }
 
     suspend fun updateOperator(operator: Operator) {
-        operatorDao.update(operator)
+        operatorDao.update(operator.copy(syncStatus = 0))
+        SyncTrigger.triggerOperatorSync(appContext, operator.id)
     }
 
-    suspend fun deleteOperator(operator: Operator) {
-        operatorDao.delete(operator)
+    suspend fun deleteOperator(operator: Operator): ConfigDeleteResult {
+        val result = ConfigDeleteService.deleteOperator(appContext, operator)
+        when (result) {
+            is ConfigDeleteResult.PhysicallyDeleted ->
+                _operators.value = _operators.value.filter { it.id != operator.id }
+            is ConfigDeleteResult.DisabledDueToReferences ->
+                _operators.value = _operators.value.map {
+                    if (it.id == operator.id) it.copy(enabled = false) else it
+                }
+            else -> {}
+        }
+        return result
     }
 
     suspend fun toggleOperatorEnabled(operator: Operator) {
         operatorDao.updateEnabledStatus(operator.id, !operator.enabled)
+        SyncTrigger.triggerOperatorSync(appContext, operator.id)
     }
-
-
 }
 
-// ViewModel Factory
 class OperatorConfigViewModelFactory(private val application: Application) : ViewModelProvider.Factory {
     override fun <T : ViewModel> create(modelClass: Class<T>): T {
         if (modelClass.isAssignableFrom(OperatorConfigViewModel::class.java)) {

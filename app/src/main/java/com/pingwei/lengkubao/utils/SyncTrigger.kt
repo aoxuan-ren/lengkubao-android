@@ -5,7 +5,8 @@ import android.content.Context
 import android.util.Log
 import com.pingwei.lengkubao.data.db.AppDatabase
 import com.pingwei.lengkubao.service.TcpSyncService
-import kotlinx.coroutines.GlobalScope
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 
 /**
@@ -19,55 +20,110 @@ object SyncTrigger {
      */
     fun triggerBillSync(context: Context, billId: Long, billType: String) {
         if (shouldAutoSync(context)) {
-            // 立即通过服务同步
             Log.i(TAG, "📡 触发实时同步: $billType, ID=$billId")
             TcpSyncService.syncBillNow(context, billId, billType)
         } else {
-            // 标记为未同步状态
             Log.d(TAG, "自动同步未开启，标记单据为未同步: $billType, ID=$billId")
             markBillAsUnsynced(context, billId, billType)
         }
     }
 
-    /**
-     * 入库单保存
-     */
     fun triggerInStockSync(context: Context, billId: Long) {
         triggerBillSync(context, billId, "IN_STOCK")
     }
 
-    /**
-     * 销售单保存
-     */
     fun triggerSaleSync(context: Context, billId: Long) {
         triggerBillSync(context, billId, "SALE")
     }
 
-    /**
-     * 包装单保存
-     */
     fun triggerPackagingSync(context: Context, billId: Long) {
         triggerBillSync(context, billId, "PACKAGING")
     }
 
+    fun triggerPreSaleSync(context: Context, billId: Long) {
+        triggerBillSync(context, billId, "PRESALE")
+    }
+
+    fun triggerPreSalePaymentSync(context: Context, paymentId: Long) {
+        triggerBillSync(context, paymentId, "PRESALE_PAYMENT")
+    }
+
+    fun triggerPreSaleOutboundSync(context: Context, outboundId: Long) {
+        triggerBillSync(context, outboundId, "PRESALE_OUTBOUND")
+    }
+
     /**
-     * 触发基础配置同步
+     * 触发基础配置同步：写入待上传 oplog，并在已连接时推送
      */
     fun triggerConfigSync(context: Context, configType: String, configId: Long) {
-        if (shouldAutoSync(context)) {
-            Log.i(TAG, "📡 触发基础配置实时同步: $configType, ID=$configId")
-            // 需要扩展 TcpSyncService 支持基础配置
-            TcpSyncService.syncConfigNow(context, configId, configType)
-        } else {
-            Log.d(TAG, "自动同步未开启，标记配置为未同步: $configType, ID=$configId")
-            // 为基础配置表添加同步状态标记
-            markConfigAsUnsynced(context, configId, configType)
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                val database = AppDatabase.getInstance(context)
+                when (configType) {
+                    "CUSTOMER" -> {
+                        database.customerDao().getCustomerById(configId)?.let {
+                            SyncOpLogHelper.enqueueCustomerUpsert(context, it)
+                        }
+                    }
+                    "LOCATION" -> {
+                        database.locationDao().getLocationById(configId)?.let {
+                            SyncOpLogHelper.enqueueLocationUpsert(context, it)
+                        }
+                    }
+                    "OPERATOR" -> {
+                        database.operatorDao().getOperatorById(configId)?.let {
+                            SyncOpLogHelper.enqueueOperatorUpsert(context, it)
+                        }
+                    }
+                    "PRODUCT" -> {
+                        database.productDao().getProductById(configId)?.let {
+                            SyncOpLogHelper.enqueueProductUpsert(context, it)
+                        }
+                    }
+                    "PACK_TYPE", "PACKAGING" -> {
+                        database.packagingTypeDao().getById(configId)?.let {
+                            SyncOpLogHelper.enqueuePackTypeUpsert(context, it)
+                        }
+                    }
+                    else -> Log.e(TAG, "未知配置类型: $configType")
+                }
+                if (shouldAutoSync(context)) {
+                    TcpSyncService.pushPendingConfigOps(context)
+                } else {
+                    markConfigAsUnsynced(context, configId, configType)
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "触发配置同步失败: ${e.message}", e)
+            }
         }
     }
 
-    // 便捷方法
+    fun triggerCustomerDelete(context: Context, customerNo: String) {
+        Log.i(TAG, "忽略手持端配置删除: CUSTOMER/$customerNo（删除以 PC 为准）")
+    }
+
+    fun triggerLocationDelete(context: Context, location: com.pingwei.lengkubao.data.db.entity.Location) {
+        Log.i(TAG, "忽略手持端配置删除: LOCATION/${location.locationName}（删除以 PC 为准）")
+    }
+
+    fun triggerOperatorDelete(context: Context, operator: com.pingwei.lengkubao.data.db.entity.Operator) {
+        Log.i(TAG, "忽略手持端配置删除: OPERATOR/${operator.name}（删除以 PC 为准）")
+    }
+
     fun triggerProductSync(context: Context, productId: Long) {
         triggerConfigSync(context, "PRODUCT", productId)
+    }
+
+    fun triggerPackTypeSync(context: Context, packTypeId: Long) {
+        triggerConfigSync(context, "PACK_TYPE", packTypeId)
+    }
+
+    fun triggerProductDelete(context: Context, product: com.pingwei.lengkubao.data.db.entity.Product) {
+        Log.i(TAG, "忽略手持端配置删除: PRODUCT/${product.productNo}（删除以 PC 为准）")
+    }
+
+    fun triggerPackTypeDelete(context: Context, packagingType: com.pingwei.lengkubao.data.db.entity.PackagingType) {
+        Log.i(TAG, "忽略手持端配置删除: PACK_TYPE/${packagingType.typeName}（删除以 PC 为准）")
     }
 
     fun triggerLocationSync(context: Context, locationId: Long) {
@@ -82,34 +138,22 @@ object SyncTrigger {
         triggerConfigSync(context, "CUSTOMER", customerId)
     }
 
-    /**
-     * 检查是否启用自动同步
-     */
     private fun shouldAutoSync(context: Context): Boolean {
         val prefs = context.getSharedPreferences("sync_config", Context.MODE_PRIVATE)
-        return prefs.getBoolean("auto_sync", false)
+        return prefs.getBoolean(Constant.PREF_AUTO_SYNC, Constant.PREF_AUTO_SYNC_DEFAULT)
     }
 
-    /**
-     * 标记单据为未同步状态
-     */
     private fun markBillAsUnsynced(context: Context, billId: Long, billType: String) {
-        GlobalScope.launch {
+        CoroutineScope(Dispatchers.IO).launch {
             try {
                 val database = AppDatabase.getInstance(context)
                 when (billType) {
-                    "IN_STOCK" -> {
-                        database.inStockBillDao().updateSyncStatus(billId, 0)
-                        Log.d(TAG, "入库单标记为未同步: $billId")
-                    }
-                    "SALE" -> {
-                        database.saleBillDao().updateSyncStatus(billId, 0)
-                        Log.d(TAG, "销售单标记为未同步: $billId")
-                    }
-                    "PACKAGING" -> {
-                        database.packagingBillDao().updateSyncStatus(billId, false)
-                        Log.d(TAG, "包装单标记为未同步: $billId")
-                    }
+                    "IN_STOCK" -> database.inStockBillDao().updateSyncStatus(billId, 0)
+                    "SALE" -> database.saleBillDao().updateSyncStatus(billId, 0)
+                    "PACKAGING" -> database.packagingBillDao().updateSyncStatus(billId, false)
+                    "PRESALE" -> database.preSaleBillDao().updateSyncStatus(billId, 0)
+                    "PRESALE_PAYMENT" -> database.paymentRecordDao().updateSyncStatus(billId, 0)
+                    "PRESALE_OUTBOUND" -> database.outboundRecordDao().updateSyncStatus(billId, 0)
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "标记未同步状态失败: ${e.message}", e)
@@ -117,34 +161,16 @@ object SyncTrigger {
         }
     }
 
-    /**
-     * 标记基础配置为未同步状态
-     */
     private fun markConfigAsUnsynced(context: Context, configId: Long, configType: String) {
-        GlobalScope.launch {
+        CoroutineScope(Dispatchers.IO).launch {
             try {
                 val database = AppDatabase.getInstance(context)
                 when (configType) {
-                    "PRODUCT" -> {
-                        // 需要先在 ProductDao 中添加 updateSyncStatus 方法
-                        // database.productDao().updateSyncStatus(configId, 0)
-                        Log.d(TAG, "商品标记为未同步: $configId (需要实现DAO方法)")
-                    }
-                    "LOCATION" -> {
-                        // 需要先在 LocationDao 中添加 updateSyncStatus 方法
-                        // database.locationDao().updateSyncStatus(configId, 0)
-                        Log.d(TAG, "库位标记为未同步: $configId (需要实现DAO方法)")
-                    }
-                    "OPERATOR" -> {
-                        // 需要先在 OperatorDao 中添加 updateSyncStatus 方法
-                        // database.operatorDao().updateSyncStatus(configId, 0)
-                        Log.d(TAG, "经手人标记为未同步: $configId (需要实现DAO方法)")
-                    }
-                    "CUSTOMER" -> {
-                        // 需要先在 CustomerDao 中添加 updateSyncStatus 方法
-                        // database.customerDao().updateSyncStatus(configId, 0)
-                        Log.d(TAG, "客户标记为未同步: $configId (需要实现DAO方法)")
-                    }
+                    "PRODUCT" -> database.productDao().updateSyncStatus(configId, 0)
+                    "LOCATION" -> database.locationDao().updateSyncStatus(configId, 0)
+                    "OPERATOR" -> database.operatorDao().updateSyncStatus(configId, 0)
+                    "CUSTOMER" -> database.customerDao().updateSyncStatus(configId, 0)
+                    "PACK_TYPE" -> { /* 包装类型无 syncStatus，未同步由 oplog 统计 */ }
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "标记配置未同步状态失败: ${e.message}", e)

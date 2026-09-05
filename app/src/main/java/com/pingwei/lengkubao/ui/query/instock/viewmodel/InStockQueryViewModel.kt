@@ -41,6 +41,7 @@ class InStockQueryViewModel(application: Application) : AndroidViewModel(applica
         startTime = QueryTimeRangeUtils.getStartTime(defaultTimeRangeLabel),
         endTime = QueryTimeRangeUtils.getEndTime(defaultTimeRangeLabel)
     )
+    private var allBills = emptyList<InStockBill>()
 
     val savedTimeRangeLabel: String = defaultTimeRangeLabel
 
@@ -48,6 +49,14 @@ class InStockQueryViewModel(application: Application) : AndroidViewModel(applica
         loadInitialData()
         // 初始化数据库实时监听，数据变更自动触发过滤更新
         observeDatabaseChanges()
+    }
+
+    /** 输入时即时按单据号/客户/首字母过滤，不触发加载态 */
+    fun updateKeyword(keyword: String?) {
+        currentSearchParams = currentSearchParams.copy(
+            keyword = keyword?.takeIf { it.isNotBlank() }
+        )
+        _bills.value = filterBillsByParams(allBills, currentSearchParams)
     }
 
     // ============ 数据刷新相关方法 ============
@@ -97,6 +106,7 @@ class InStockQueryViewModel(application: Application) : AndroidViewModel(applica
                 )
                 // 触发一次初始数据加载
                 val billList = database.inStockBillDao().getAllBills().first()
+                allBills = billList
                 Log.d(TAG, "📋 从数据库加载到 ${billList.size} 张单据")
                 // 应用默认条件过滤
                 val filteredBills = filterBillsByParams(billList, currentSearchParams)
@@ -118,6 +128,7 @@ class InStockQueryViewModel(application: Application) : AndroidViewModel(applica
         viewModelScope.launch {
             database.inStockBillDao().getAllBills().collect { billList ->
                 Log.d(TAG, "📊 数据库数据发生变化，共 ${billList.size} 条记录")
+                allBills = billList
                 // 复用过滤逻辑，自动应用当前搜索条件
                 val filteredBills = filterBillsByParams(billList, currentSearchParams)
                 _bills.value = filteredBills
@@ -156,6 +167,7 @@ class InStockQueryViewModel(application: Application) : AndroidViewModel(applica
         )
 
         val billList = database.inStockBillDao().getAllBills().first()
+        allBills = billList
         Log.d(TAG, "📋 待筛选单据总数：${billList.size}")
         val filteredBills = filterBillsByParams(billList, currentSearchParams)
         Log.d(TAG, "🎯 搜索匹配结果数：${filteredBills.size}")

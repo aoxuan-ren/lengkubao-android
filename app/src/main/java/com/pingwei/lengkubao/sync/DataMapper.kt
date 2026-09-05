@@ -114,25 +114,22 @@ class DataMapper {
      */
     fun mapLocationToJson(location: Location): String {
         val jsonData = mapOf(
-            "name" to location.locationName,              // 库位名称
-            "code" to location.locationNo,                // 库位编号
-            "description" to location.description,        // 描述
-            "capacity" to location.capacity.toString(),   // 容量
-            "is_active" to location.enabled               // 是否启用
+            "name" to location.locationName,
+            "code" to location.locationName,
+            "description" to location.description,
+            "capacity" to location.capacity.toString(),
+            "is_active" to location.enabled,
         )
         return convertMapToJson(jsonData)
     }
 
-    /**
-     * 映射经手人数据（如果需要）
-     */
     fun mapOperatorToJson(operator: Operator): String {
         val jsonData = mapOf(
-            "name" to operator.name,                      // 经手人姓名
-            "code" to operator.operatorNo,                // 经手人编号
-            "phone" to operator.phone,                    // 联系电话
-            "role" to operator.role,                      // 角色
-            "is_active" to operator.enabled               // 是否启用
+            "name" to operator.name,
+            "code" to operator.name,
+            "phone" to operator.phone,
+            "role" to operator.role,
+            "is_active" to operator.enabled,
         )
         return convertMapToJson(jsonData)
     }

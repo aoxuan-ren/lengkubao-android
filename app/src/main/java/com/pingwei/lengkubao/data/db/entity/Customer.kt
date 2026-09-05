@@ -33,5 +33,9 @@ data class Customer(
 
     /** 客户类型：SELLER=货主/卖家，BUYER=买家 */
     @ColumnInfo(name = "customer_type", defaultValue = "SELLER")
-    val customerType: String = CustomerType.SELLER
+    val customerType: String = CustomerType.SELLER,
+
+    /** 是否启用（与 PC clients.status 对应） */
+    @ColumnInfo(name = "enabled", defaultValue = "1")
+    val enabled: Boolean = true
 )

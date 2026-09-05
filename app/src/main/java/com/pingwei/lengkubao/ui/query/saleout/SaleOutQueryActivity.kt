@@ -7,7 +7,7 @@ import androidx.activity.compose.setContent
 import com.pingwei.lengkubao.ui.theme.LengkubaoTheme
 
 /**
- * 销售单查询Activity
+ * 报账单查询Activity
  * 包装SaleOutQueryScreen，与入库/包装查询Activity结构一致
  */
 class SaleOutQueryActivity : ComponentActivity() {

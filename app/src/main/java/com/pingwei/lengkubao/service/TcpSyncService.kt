@@ -13,8 +13,11 @@ import com.pingwei.lengkubao.data.db.AppDatabase
 import com.pingwei.lengkubao.sync.TcpSyncManager
 import com.pingwei.lengkubao.sync.SyncState
 import com.pingwei.lengkubao.sync.mdns.MdnsDeviceDiscovery
+import com.pingwei.lengkubao.sync.udp.UdpDeviceDiscovery
 import com.pingwei.lengkubao.ui.main.MainActivity
 import com.pingwei.lengkubao.utils.Constant
+import com.pingwei.lengkubao.utils.SyncStatusUtils
+import com.pingwei.lengkubao.utils.SyncTrigger
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.first
 import java.util.concurrent.ConcurrentHashMap
@@ -43,6 +46,8 @@ class TcpSyncService : Service() {
         const val EXTRA_BILL_ID_BROADCAST = "broadcast_bill_id"
         const val EXTRA_BILL_TYPE_BROADCAST = "broadcast_bill_type"
         const val EXTRA_ERROR_MSG = "error_message"
+        const val EXTRA_DUPLICATE_NOTICE = "duplicate_notice"
+        const val EXTRA_FORCE_RESET_SYNC = "force_reset_sync"
         const val EXTRA_CONFIG_ID = "config_id"
         const val EXTRA_CONFIG_TYPE = "config_type"
         // 启动同步服务
@@ -68,7 +73,15 @@ class TcpSyncService : Service() {
                 context.startService(intent)
             }
         }
-        // 新增：立即同步基础配置
+        fun pushPendingConfigOps(context: Context) {
+            val intent = Intent(context, TcpSyncService::class.java).apply {
+                action = ACTION_SYNC_CONFIG
+                putExtra(EXTRA_CONFIG_ID, -1L)
+                putExtra(EXTRA_CONFIG_TYPE, "PENDING_OPS")
+            }
+            context.startService(intent)
+        }
+
         fun syncConfigNow(context: Context, configId: Long, configType: String) {
             val intent = Intent(context, TcpSyncService::class.java).apply {
                 action = ACTION_SYNC_CONFIG
@@ -77,6 +90,7 @@ class TcpSyncService : Service() {
             }
             context.startService(intent)
         }
+
         // 停止同步服务
         fun stopService(context: Context) {
             val intent = Intent(context, TcpSyncService::class.java).apply {
@@ -86,11 +100,12 @@ class TcpSyncService : Service() {
         }
 
         // 立即同步某张单据
-        fun syncBillNow(context: Context, billId: Long, billType: String) {
+        fun syncBillNow(context: Context, billId: Long, billType: String, forceResetSync: Boolean = false) {
             val intent = Intent(context, TcpSyncService::class.java).apply {
                 action = ACTION_SYNC_NOW
                 putExtra(EXTRA_BILL_ID, billId)
                 putExtra(EXTRA_BILL_TYPE, billType)
+                putExtra(EXTRA_FORCE_RESET_SYNC, forceResetSync)
             }
             context.startService(intent)
         }
@@ -104,21 +119,28 @@ class TcpSyncService : Service() {
     }
 
     private val inFlightTasks = ConcurrentHashMap.newKeySet<String>()
+    private val presaleResyncPending = ConcurrentHashMap.newKeySet<Long>()
+    private val packagingResyncPending = ConcurrentHashMap.newKeySet<Long>()
 
     override fun onCreate() {
         super.onCreate()
-        // 初始化数据库和同步管理器
-        val database = AppDatabase.getInstance(applicationContext)
-        syncManager = TcpSyncManager.getInstance(applicationContext, database)
+        refreshSyncManager()
         // 创建通知通道（8.0+必须）
         createNotificationChannel()
         // 启动前台服务，避免被系统杀死
         startForeground(NOTIFICATION_ID, createNotification("TCP同步服务启动中..."))
     }
 
+    private fun refreshSyncManager(): TcpSyncManager {
+        val database = AppDatabase.getInstance(applicationContext)
+        syncManager = TcpSyncManager.getInstance(applicationContext, database)
+        return syncManager
+    }
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         // 🔧 关键修改：如果没有intent或intent为null，也自动启动同步服务
         val action = intent?.action ?: ACTION_START_SYNC
+        refreshSyncManager()
 
         when (action) {
             ACTION_START_SYNC -> {
@@ -128,9 +150,10 @@ class TcpSyncService : Service() {
                     Log.d("TcpSyncService", "🔧 服务已在运行，检查连接状态...")
                     // 检查连接状态，如果断开则重连
                     scope.launch {
-                        val currSyncManager = TcpSyncManager.getInstance(applicationContext, AppDatabase.getInstance(applicationContext))
+                        val currSyncManager = refreshSyncManager()
                         if (!currSyncManager.isConnected()) {
                             Log.i("TcpSyncService", "🔄 检测到连接断开，触发重连")
+                            currSyncManager.enableColdStartMode()
                             currSyncManager.connect()
                         }
                     }
@@ -143,9 +166,10 @@ class TcpSyncService : Service() {
             ACTION_SYNC_NOW -> {
                 val billId = intent?.getLongExtra(EXTRA_BILL_ID, 0)
                 val billType = intent?.getStringExtra(EXTRA_BILL_TYPE) ?: ""
+                val forceResetSync = intent?.getBooleanExtra(EXTRA_FORCE_RESET_SYNC, false) ?: false
                 if (billId != null) {
                     if (billId > 0 && billType.isNotBlank()) {
-                        syncBillImmediately(billId, billType)
+                        syncBillImmediately(billId, billType, forceResetSync)
                     } else {
                         Log.e("TcpSyncService", "实时同步参数异常：billId=$billId, billType=$billType")
                     }
@@ -155,9 +179,11 @@ class TcpSyncService : Service() {
                 syncPendingDataImmediately()
             }
             ACTION_SYNC_CONFIG -> {
-                val configId = intent?.getLongExtra(EXTRA_CONFIG_ID, 0)
+                val configId = intent?.getLongExtra(EXTRA_CONFIG_ID, 0) ?: 0L
                 val configType = intent?.getStringExtra(EXTRA_CONFIG_TYPE) ?: ""
-                if (configId != null && configId > 0 && configType.isNotBlank()) {
+                if (configType == "PENDING_OPS") {
+                    pushPendingConfigOpsImmediately()
+                } else if (configId > 0 && configType.isNotBlank()) {
                     syncConfigImmediately(configId, configType)
                 }
             }
@@ -191,16 +217,24 @@ class TcpSyncService : Service() {
                     Log.e(TAG, "同步失败：服务未启动")
                     return@launch
                 }
-
-                when (configType) {
-
-                    "LOCATION" -> syncManager.syncLocation(configId)
-                    "OPERATOR" -> syncManager.syncOperator(configId)
-                    "CUSTOMER" -> syncManager.syncCustomer(configId)
-                    else -> Log.e(TAG, "未知配置类型: $configType")
-                }
+                SyncTrigger.triggerConfigSync(applicationContext, configType, configId)
+                syncManager.pushPendingConfigOps()
             } catch (e: Exception) {
                 Log.e(TAG, "同步基础配置失败", e)
+            }
+        }
+    }
+
+    private fun pushPendingConfigOpsImmediately() {
+        scope.launch(Dispatchers.IO) {
+            try {
+                if (!isServiceRunning) {
+                    Log.e(TAG, "同步失败：服务未启动")
+                    return@launch
+                }
+                syncManager.pushPendingConfigOps()
+            } catch (e: Exception) {
+                Log.e(TAG, "推送待上传配置失败", e)
             }
         }
     }
@@ -208,6 +242,7 @@ class TcpSyncService : Service() {
     private fun startSyncService() {
         scope.launch {
             isServiceRunning = true
+            refreshSyncManager()
             updateNotification("正在初始化...")
 
             // 检查是否启用自动配对
@@ -219,34 +254,49 @@ class TcpSyncService : Service() {
                 updateNotification("🔍 正在自动扫描配对设备...")
                 Log.i(TAG, "🔍 启动自动配对扫描，配对码: $savedPairingCode")
 
-                // 尝试自动连接
-                val mdnsDiscovery = MdnsDeviceDiscovery.getInstance(applicationContext)
-                val device = mdnsDiscovery.autoConnect(savedPairingCode)
+                val discoveryMethod = prefs.getString(Constant.PREF_DISCOVERY_METHOD, "both") ?: "both"
+                var discoveredIp: String? = null
+                var discoveredPort: Int? = null
 
-                if (device != null) {
-                    Log.i(TAG, "✅ 自动配对成功: ${device.deviceName} (${device.ip}:${device.port})")
-                    updateNotification("✅ 找到配对设备: ${device.deviceName}")
+                if (discoveryMethod == "udp" || discoveryMethod == "both") {
+                    val udpDevice = UdpDeviceDiscovery.getInstance(applicationContext).autoConnect(savedPairingCode)
+                    if (udpDevice != null) {
+                        discoveredIp = udpDevice.ip
+                        discoveredPort = udpDevice.port
+                        Log.i(TAG, "✅ UDP自动发现成功: ${udpDevice.deviceName} (${udpDevice.ip}:${udpDevice.port})")
+                    }
+                }
 
-                    // 更新配置
+                if (discoveredIp == null && (discoveryMethod == "mdns" || discoveryMethod == "both")) {
+                    val mdnsDevice = MdnsDeviceDiscovery.getInstance(applicationContext).autoConnect(savedPairingCode)
+                    if (mdnsDevice != null) {
+                        discoveredIp = mdnsDevice.ip
+                        discoveredPort = mdnsDevice.port
+                        Log.i(TAG, "✅ mDNS自动发现成功: ${mdnsDevice.deviceName} (${mdnsDevice.ip}:${mdnsDevice.port})")
+                    }
+                }
+
+                if (discoveredIp != null && discoveredPort != null) {
+                    updateNotification("✅ 找到配对设备: $discoveredIp")
                     syncManager.updateConfig(
                         TcpSyncManager.SyncConfig(
-                            serverIp = device.ip,
-                            serverPort = device.port
+                            serverIp = discoveredIp,
+                            serverPort = discoveredPort
                         )
                     )
-
-                    // 保存配对信息
                     prefs.edit().apply {
-                        putString(Constant.PREF_PAIRED_SERVER_IP, device.ip)
-                        putInt(Constant.PREF_PAIRED_SERVER_PORT, device.port)
+                        putString(Constant.PREF_PAIRED_SERVER_IP, discoveredIp)
+                        putInt(Constant.PREF_PAIRED_SERVER_PORT, discoveredPort)
                     }.apply()
-
-                    // 延迟一下再连接
-                    delay(1000)
+                    syncManager.notifyDiscoveryApplied()
+                    delay(500)
                 } else {
-                    Log.w(TAG, "⚠️ 自动配对未找到设备，使用保存的IP")
+                    Log.w(TAG, "⚠️ 自动发现未找到设备，使用保存的IP")
                     val savedIp = prefs.getString(Constant.PREF_PAIRED_SERVER_IP, null)
-                    if (!savedIp.isNullOrBlank()) {
+                    if (!savedIp.isNullOrBlank() &&
+                        TcpSyncManager.isValidServerIp(savedIp) &&
+                        !TcpSyncManager.isUntrustedCachedIp(applicationContext, savedIp)
+                    ) {
                         val savedPort = prefs.getInt(Constant.PREF_PAIRED_SERVER_PORT, 8080)
                         syncManager.updateConfig(
                             TcpSyncManager.SyncConfig(
@@ -254,10 +304,13 @@ class TcpSyncService : Service() {
                                 serverPort = savedPort
                             )
                         )
+                    } else if (!savedIp.isNullOrBlank()) {
+                        Log.w(TAG, "⚠️ 保存的IP不可用($savedIp)，将依赖后台自动发现")
                     }
                 }
             }
 
+            syncManager.enableColdStartMode()
             // 连接服务器
             updateNotification("正在连接服务器...")
             syncManager.connect()
@@ -266,25 +319,9 @@ class TcpSyncService : Service() {
             syncManager.connectionState.collect { state ->
                 val notifyMsg = when (state) {
                     TcpSyncManager.ConnectionState.CONNECTED -> {
-                        // ========== 关键修改：连接成功后自动同步基础配置 ==========
-                        Log.i(TAG, "✅ 已连接到服务器，开始自动同步基础配置...")
-
-                        // 延迟2秒，确保连接稳定
-                        delay(2000)
-
-                        // 执行自动同步基础配置
-                        launch {
-                            try {
-                                Log.i(TAG, "🚀 自动同步基础配置开始")
-                                syncManager.autoSyncConfigsOnStartup()
-                            } catch (e: Exception) {
-                                Log.e(TAG, "❌ 自动同步基础配置失败", e)
-                            }
-                        }
-
                         "✅ 已连接到同步服务器"
                     }
-                    TcpSyncManager.ConnectionState.CONNECTING -> "🔌 正在连接服务器..."
+                    TcpSyncManager.ConnectionState.CONNECTING -> "🔌 正在连接/注册..."
                     TcpSyncManager.ConnectionState.ERROR -> "❌ 连接失败"
                     TcpSyncManager.ConnectionState.DISCONNECTED -> "📴 已断开"
                     TcpSyncManager.ConnectionState.SYNCING -> "🔄 正在同步数据..."
@@ -306,11 +343,19 @@ class TcpSyncService : Service() {
     }
 
     // 核心优化：实时同步单张单据方法（带确认机制）
-    private fun syncBillImmediately(billId: Long, billType: String) {
+    private fun syncBillImmediately(billId: Long, billType: String, forceResetSync: Boolean = false) {
         scope.launch(Dispatchers.IO) {
             val taskKey = "BILL|$billType|$billId"
             if (!inFlightTasks.add(taskKey)) {
-                Log.w(TAG, "[$billType-$billId] 同步任务已在进行中，忽略重复触发")
+                if (billType == "PRESALE") {
+                    presaleResyncPending.add(billId)
+                    Log.w(TAG, "[$billType-$billId] 同步进行中，已排队等待再次上传")
+                } else if (billType == "PACKAGING") {
+                    packagingResyncPending.add(billId)
+                    Log.w(TAG, "[$billType-$billId] 同步进行中，已排队等待再次上传")
+                } else {
+                    Log.w(TAG, "[$billType-$billId] 同步任务已在进行中，忽略重复触发")
+                }
                 return@launch
             }
             val billTypeName = when (billType) {
@@ -319,6 +364,9 @@ class TcpSyncService : Service() {
                 "PACKAGING" -> "包装单"
                 "ADVANCE" -> "预支款"
                 "DEDUCTION" -> "扣款"
+                "PRESALE" -> "预售单"
+                "PRESALE_PAYMENT" -> "预售收款"
+                "PRESALE_OUTBOUND" -> "预售出库"
                 else -> "未知单据"
             }
             val tag = "[$billType-$billId]"
@@ -347,27 +395,59 @@ class TcpSyncService : Service() {
                 updateNotification("🔄 $notifyPrefix...")
                 Log.i(TAG, "$tag 开始执行$notifyPrefix")
 
-                // 执行同步并等待结果
-                val syncResult = when (billType) {
-                    "IN_STOCK" -> syncManager.syncInStockBill(billId)
-                    "SALE" -> syncManager.syncSaleBill(billId)
-                    "PACKAGING" -> syncManager.syncPackagingBill(billId)
-                    "ADVANCE" -> syncManager.syncAdvance(billId)
-                    "DEDUCTION" -> syncManager.syncDeduction(billId)
-                    else -> false
+                if (billType == "PACKAGING" && forceResetSync) {
+                    SyncStatusUtils.resetPackagingBillSyncStatus(this@TcpSyncService, billId)
+                    syncManager.clearConfirmedItemsForPackagingBill(billId)
                 }
 
-                // 处理结果
-                if (syncResult) {
-                    val successMsg = "$billTypeName $billId 同步成功"
-                    Log.i(TAG, "$tag ✅ $successMsg")
-                    updateNotification("✅ $successMsg")
-                    sendSyncCompleteBroadcast(billId, billType, true, "")
+                // 执行同步并等待结果
+                if (billType == "PACKAGING") {
+                    val packagingResult = syncManager.syncPackagingBill(billId)
+                    if (packagingResult.success) {
+                        val successMsg = "$billTypeName $billId 同步成功"
+                        Log.i(TAG, "$tag ✅ $successMsg")
+                        updateNotification("✅ $successMsg")
+                        sendSyncCompleteBroadcast(
+                            billId = billId,
+                            billType = billType,
+                            isSuccess = true,
+                            errorMsg = "",
+                            duplicateNotice = packagingResult.duplicateNotice,
+                        )
+                    } else {
+                        val failMsg = packagingResult.errorMessage ?: "$billTypeName $billId 同步失败"
+                        Log.e(TAG, "$tag ❌ $failMsg")
+                        updateNotification("❌ $failMsg")
+                        sendSyncCompleteBroadcast(
+                            billId = billId,
+                            billType = billType,
+                            isSuccess = false,
+                            errorMsg = failMsg,
+                        )
+                    }
                 } else {
-                    val failMsg = "$billTypeName $billId 同步失败"
-                    Log.e(TAG, "$tag ❌ $failMsg")
-                    updateNotification("❌ $failMsg")
-                    sendSyncCompleteBroadcast(billId, billType, false, "服务器保存失败或超时")
+                    val syncResult = when (billType) {
+                        "IN_STOCK" -> syncManager.syncInStockBill(billId)
+                        "SALE" -> syncManager.syncSaleBill(billId)
+                        "ADVANCE" -> syncManager.syncAdvance(billId)
+                        "DEDUCTION" -> syncManager.syncDeduction(billId)
+                        "PRESALE" -> syncManager.syncPreSaleBill(billId)
+                        "PRESALE_PAYMENT" -> syncManager.syncPreSalePayment(billId)
+                        "PRESALE_OUTBOUND" -> syncManager.syncPreSaleOutbound(billId)
+                        else -> false
+                    }
+
+                    if (syncResult) {
+                        val successMsg = "$billTypeName $billId 同步成功"
+                        Log.i(TAG, "$tag ✅ $successMsg")
+                        updateNotification("✅ $successMsg")
+                        sendSyncCompleteBroadcast(billId, billType, true, "")
+                    } else {
+                        val failMsg = "$billTypeName $billId 同步失败"
+                        Log.e(TAG, "$tag ❌ $failMsg")
+                        updateNotification("❌ $failMsg")
+                        sendSyncCompleteBroadcast(billId, billType, false, "服务器保存失败或超时")
+                    }
                 }
 
             } catch (e: CancellationException) {
@@ -381,6 +461,13 @@ class TcpSyncService : Service() {
                 sendSyncCompleteBroadcast(billId, billType, false, errorMsg)
             } finally {
                 inFlightTasks.remove(taskKey)
+                if (billType == "PRESALE" && presaleResyncPending.remove(billId)) {
+                    Log.i(TAG, "$tag 执行排队中的预售单再次上传")
+                    syncBillImmediately(billId, billType)
+                } else if (billType == "PACKAGING" && packagingResyncPending.remove(billId)) {
+                    Log.i(TAG, "$tag 执行排队中的包装单再次上传")
+                    syncBillImmediately(billId, billType)
+                }
             }
         }
     }
@@ -390,31 +477,41 @@ class TcpSyncService : Service() {
             val taskKey = "BATCH|PENDING"
             if (!inFlightTasks.add(taskKey)) {
                 Log.w(TAG, "批量同步任务已在进行中，忽略重复触发")
+                sendSyncCompleteBroadcast(-1L, "BATCH", false, "批量同步任务已在进行中")
                 return@launch
             }
             try {
                 if (!isServiceRunning) {
-                    updateNotification("❌ 批量同步失败：同步服务未启动")
+                    val errorMsg = "同步服务未启动，请检查同步配置"
+                    updateNotification("❌ 批量同步失败：$errorMsg")
+                    sendSyncCompleteBroadcast(-1L, "BATCH", false, errorMsg)
                     return@launch
                 }
                 val currentConnState = syncManager.connectionState.value
                 if (currentConnState != TcpSyncManager.ConnectionState.CONNECTED) {
-                    updateNotification("❌ 批量同步失败：TCP未连接")
+                    val errorMsg = "TCP未连接（${currentConnState.name}），请确认电脑端已启动同步服务"
+                    updateNotification("❌ 批量同步失败：$errorMsg")
+                    sendSyncCompleteBroadcast(-1L, "BATCH", false, errorMsg)
                     return@launch
                 }
                 updateNotification("🔄 开始批量同步未完成单据...")
                 val success = syncManager.syncPendingData()
                 if (success) {
                     updateNotification("✅ 批量同步任务已触发，等待服务器确认")
+                    sendSyncCompleteBroadcast(-1L, "BATCH", true, "")
                 } else {
-                    updateNotification("❌ 批量同步执行失败")
+                    val errorMsg = "批量同步执行失败，请查看日志"
+                    updateNotification("❌ $errorMsg")
+                    sendSyncCompleteBroadcast(-1L, "BATCH", false, errorMsg)
                 }
             } catch (e: CancellationException) {
                 Log.w(TAG, "批量同步被取消", e)
                 updateNotification("⚠️ 批量同步被取消")
+                sendSyncCompleteBroadcast(-1L, "BATCH", false, "批量同步被取消")
             } catch (e: Exception) {
                 Log.e(TAG, "批量同步执行异常", e)
                 updateNotification("❌ 批量同步异常：${e.message}")
+                sendSyncCompleteBroadcast(-1L, "BATCH", false, e.message ?: "批量同步异常")
             } finally {
                 inFlightTasks.remove(taskKey)
             }
@@ -446,15 +543,17 @@ class TcpSyncService : Service() {
         billId: Long,
         billType: String,
         isSuccess: Boolean,
-        errorMsg: String
+        errorMsg: String,
+        duplicateNotice: String? = null,
     ) {
         Intent(ACTION_SYNC_COMPLETE).apply {
-            // 透传核心参数，方便前端精准匹配单据
             putExtra(EXTRA_BILL_ID_BROADCAST, billId)
             putExtra(EXTRA_BILL_TYPE_BROADCAST, billType)
             putExtra(EXTRA_RESULT, isSuccess)
             putExtra(EXTRA_ERROR_MSG, errorMsg)
-            // 发送广播，支持跨组件通信
+            if (!duplicateNotice.isNullOrBlank()) {
+                putExtra(EXTRA_DUPLICATE_NOTICE, duplicateNotice)
+            }
             sendBroadcast(this)
         }
     }

@@ -1,5 +1,10 @@
 package com.pingwei.lengkubao.ui.query.packaging
 
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.util.Log
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
@@ -13,14 +18,18 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.pingwei.lengkubao.service.TcpSyncService
+import com.pingwei.lengkubao.ui.query.common.PackagingQueryPrintDialog
 import com.pingwei.lengkubao.ui.query.packaging.viewmodel.PackagingDetailViewModel
 import com.pingwei.lengkubao.ui.theme.AppDimens
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
-import android.content.Context
-import android.widget.Toast
 import java.text.SimpleDateFormat
 import java.util.*
+
+private data class SyncResultDialogState(val title: String, val message: String)
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -88,6 +97,102 @@ fun PackagingDetailScreen(
     val bill by viewModel.bill.collectAsState()
     val items by viewModel.items.collectAsState()
     val isLoading by viewModel.isLoading.collectAsState()
+    val isResetSyncing by viewModel.isResetSyncing.collectAsState()
+    var showPrintDialog by remember { mutableStateOf(false) }
+    var showResetConfirm by remember { mutableStateOf(false) }
+    var syncResultDialog by remember { mutableStateOf<SyncResultDialogState?>(null) }
+
+    DisposableEffect(billId) {
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(ctx: Context?, intent: Intent?) {
+                if (intent?.action != TcpSyncService.ACTION_SYNC_COMPLETE) return
+                val broadcastBillId = intent.getLongExtra(TcpSyncService.EXTRA_BILL_ID_BROADCAST, 0)
+                val billType = intent.getStringExtra(TcpSyncService.EXTRA_BILL_TYPE_BROADCAST)
+                if (broadcastBillId != billId || billType != "PACKAGING") return
+
+                val isSuccess = intent.getBooleanExtra(TcpSyncService.EXTRA_RESULT, false)
+                val errorMsg = intent.getStringExtra(TcpSyncService.EXTRA_ERROR_MSG).orEmpty()
+                val duplicateNotice = intent.getStringExtra(TcpSyncService.EXTRA_DUPLICATE_NOTICE)
+
+                Log.d("PackagingDetailScreen", "同步完成 billId=$billId success=$isSuccess")
+                coroutineScope.launch {
+                    viewModel.onResetSyncComplete()
+                    delay(300)
+                    viewModel.loadBill(billId, force = true)
+                    syncResultDialog = when {
+                        isSuccess && !duplicateNotice.isNullOrBlank() -> SyncResultDialogState(
+                            title = "电脑端已有相同单据",
+                            message = duplicateNotice
+                        )
+                        isSuccess -> SyncResultDialogState(
+                            title = "同步成功",
+                            message = "包装单已成功同步到电脑端。"
+                        )
+                        else -> SyncResultDialogState(
+                            title = "同步失败",
+                            message = errorMsg.ifBlank { "未知错误，请检查网络连接后重试。" }
+                        )
+                    }
+                }
+            }
+        }
+        val filter = IntentFilter(TcpSyncService.ACTION_SYNC_COMPLETE)
+        ContextCompat.registerReceiver(context, receiver, filter, ContextCompat.RECEIVER_NOT_EXPORTED)
+        onDispose {
+            try {
+                context.unregisterReceiver(receiver)
+            } catch (_: IllegalArgumentException) {
+            }
+        }
+    }
+
+    if (showResetConfirm) {
+        AlertDialog(
+            onDismissRequest = { showResetConfirm = false },
+            title = { Text("重置并同步") },
+            text = {
+                Text("将把本单标记为未同步并重新上传到电脑；若电脑已有相同数据，不会重复保存。")
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    showResetConfirm = false
+                    viewModel.requestResetAndSync()
+                }) {
+                    Text("确定")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showResetConfirm = false }) {
+                    Text("取消")
+                }
+            }
+        )
+    }
+
+    syncResultDialog?.let { dialog ->
+        AlertDialog(
+            onDismissRequest = { syncResultDialog = null },
+            title = { Text(dialog.title) },
+            text = { Text(dialog.message) },
+            confirmButton = {
+                TextButton(onClick = { syncResultDialog = null }) {
+                    Text("确定")
+                }
+            }
+        )
+    }
+
+    PackagingQueryPrintDialog(
+        show = showPrintDialog,
+        bill = bill,
+        items = items,
+        onDismiss = { showPrintDialog = false },
+        onPrintSuccess = {
+            coroutineScope.launch {
+                viewModel.markPrinted()
+            }
+        }
+    )
 
     Scaffold(
         topBar = {
@@ -169,13 +274,8 @@ fun PackagingDetailScreen(
                                     text = { Text("打印") },
                                     onClick = {
                                         expanded = false
-                                        coroutineScope.launch {
-                                            val result = viewModel.printBill()
-                                            if (result) {
-                                                Toast.makeText(context, "打印状态已更新", Toast.LENGTH_SHORT).show()
-                                            } else {
-                                                Toast.makeText(context, "打印状态更新失败", Toast.LENGTH_SHORT).show()
-                                            }
+                                        if (items.isNotEmpty()) {
+                                            showPrintDialog = true
                                         }
                                     },
                                     leadingIcon = {
@@ -183,6 +283,17 @@ fun PackagingDetailScreen(
                                     }
                                 )
                             }
+                        }
+
+                        IconButton(
+                            onClick = {
+                                if (items.isNotEmpty()) {
+                                    showPrintDialog = true
+                                }
+                            },
+                            enabled = items.isNotEmpty()
+                        ) {
+                            Icon(Icons.Default.Print, contentDescription = "打印")
                         }
                     } else if (bill != null) {
                         // 已作废单据只显示物理删除选项
@@ -208,6 +319,37 @@ fun PackagingDetailScreen(
                     }
                 }
             )
+        },
+        bottomBar = {
+            if (bill != null && !bill!!.isVoided) {
+                Surface(tonalElevation = 3.dp) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 16.dp, vertical = 12.dp),
+                        horizontalArrangement = Arrangement.Center
+                    ) {
+                        Button(
+                            onClick = { showResetConfirm = true },
+                            enabled = !isResetSyncing,
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            if (isResetSyncing) {
+                                CircularProgressIndicator(
+                                    modifier = Modifier.size(18.dp),
+                                    strokeWidth = 2.dp
+                                )
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text("同步中…")
+                            } else {
+                                Icon(Icons.Default.Sync, contentDescription = null)
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text("重置并同步")
+                            }
+                        }
+                    }
+                }
+            }
         }
     ) { paddingValues ->
         Box(
@@ -259,12 +401,12 @@ fun PackagingDetailScreen(
                                     color = MaterialTheme.colorScheme.primary
                                 )
 
-                                // 【新增】显示取包装/退包装标记
+                                // 【新增】显示出包装/进包装标记
                                 val flag = bill!!.packagingTypeFlag
                                 val (flagText, flagIcon, flagColor) = if (flag == "TAKE") {
-                                    Triple("取包装", Icons.Default.ExitToApp, MaterialTheme.colorScheme.primary)
+                                    Triple("出包装", Icons.Default.ExitToApp, MaterialTheme.colorScheme.primary)
                                 } else {
-                                    Triple("退包装", Icons.Default.ArrowBack, MaterialTheme.colorScheme.error)
+                                    Triple("进包装", Icons.Default.ArrowBack, MaterialTheme.colorScheme.error)
                                 }
 
                                 Row(

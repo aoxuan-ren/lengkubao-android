@@ -5,9 +5,11 @@ import android.app.Application
 import android.content.Context
 import android.util.Log
 import com.pingwei.lengkubao.data.db.AppDatabase
+import com.pingwei.lengkubao.fiscal.FiscalYearManager
 import com.pingwei.lengkubao.service.TcpSyncService
 import com.pingwei.lengkubao.sync.TcpSyncManager
 import com.pingwei.lengkubao.utils.AppCacheCleaner
+import com.pingwei.lengkubao.utils.Constant
 import com.pingwei.lengkubao.utils.PrinterStateManager
 import com.sunmi.tms.api.TMSApi
 import com.sunmi.tms.exception.TmsServiceDisconnectedException
@@ -40,6 +42,15 @@ class LengKuBaoApplication : Application() {
          * 获取数据库实例
          */
         fun getDatabase(): AppDatabase = appDatabase
+
+        /**
+         * 年份切换后重新加载数据库单例。
+         */
+        fun reloadDatabaseInstance() {
+            AppDatabase.destroyInstance()
+            appDatabase = AppDatabase.getInstance(instance)
+            Log.d("LengKuBaoApp", "Database reloaded: ${FiscalYearManager.getActiveDbName()}")
+        }
     }
 
     override fun onCreate() {
@@ -66,16 +77,16 @@ class LengKuBaoApplication : Application() {
     }
 
     private fun initDatabase() {
+        FiscalYearManager.initialize(this)
         try {
-            // 强制清理旧数据库（开发阶段）- 原有逻辑
             AppDatabase.destroyInstance()
             Log.d(TAG, "✅ Old database instance cleared")
         } catch (e: Exception) {
             Log.e(TAG, "❌ Failed to clear old database: ${e.message}")
         }
 
-        // 初始化数据库全局单例
         appDatabase = AppDatabase.getInstance(this)
+        Log.d(TAG, "✅ Database initialized: ${FiscalYearManager.getActiveDbName()}")
     }
 
     private fun initTMSSdk() {
@@ -93,7 +104,7 @@ class LengKuBaoApplication : Application() {
     private fun initTcpSync() {
         // 初始化时自动启动同步服务（如果配置了自动同步）
         val prefs = getSharedPreferences("sync_config", Context.MODE_PRIVATE)
-        if (prefs.getBoolean("auto_sync", false)) {
+        if (prefs.getBoolean(Constant.PREF_AUTO_SYNC, Constant.PREF_AUTO_SYNC_DEFAULT)) {
             Log.i(TAG, "📡 应用启动，自动开启后台同步服务")
             TcpSyncService.startService(this)
         }

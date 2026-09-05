@@ -6,6 +6,8 @@ import android.content.SharedPreferences
 import android.util.Log
 import com.pingwei.lengkubao.service.model.InStockItemPrint
 import com.pingwei.lengkubao.service.model.PackagingItemPrint
+import com.pingwei.lengkubao.service.model.PreSaleItemPrint
+import com.pingwei.lengkubao.service.model.SaleItemPrint
 import com.pingwei.lengkubao.ui.common.ConfigManager
 import com.sunmi.peripheral.printer.InnerPrinterCallback
 import com.sunmi.peripheral.printer.InnerPrinterManager
@@ -502,13 +504,13 @@ class SunmiPrintService(private val context: Context) {
 
             val normalizedFlag = items.firstOrNull()?.packagingTypeFlag?.uppercase(Locale.ROOT)
             val packagingFlagLabel = when (normalizedFlag) {
-                "RETURN" -> "退包装"
-                "TAKE" -> "取包装"
-                else -> if (totalAmount < 0) "退包装" else "取包装"
+                "RETURN" -> "进包装"
+                "TAKE" -> "出包装"
+                else -> if (totalAmount < 0) "进包装" else "出包装"
             }
 
             // 单据标题
-            val billTitle = if (packagingFlagLabel == "退包装") "（退）包装记账单" else "（取）包装记账单"
+            val billTitle = if (packagingFlagLabel == "进包装") "（进）包装记账单" else "（出）包装记账单"
             printText(billTitle, 1)
             printSeparator()
 
@@ -577,6 +579,176 @@ class SunmiPrintService(private val context: Context) {
                 }
             }
 
+            success
+        } catch (e: Exception) {
+            e.printStackTrace()
+            try {
+                sunmiPrinterService!!.exitPrinterBuffer(false)
+            } catch (ex: Exception) {
+                ex.printStackTrace()
+            }
+            false
+        }
+    }
+
+    /**
+     * 打印预售/出库销售单
+     */
+    @SuppressLint("DefaultLocale")
+    suspend fun printPreSaleBill(
+        billNo: String,
+        buyerName: String,
+        locationName: String,
+        operatorName: String,
+        saleMode: String,
+        items: List<PreSaleItemPrint>,
+        totalAmount: Double,
+        paidAmount: Double,
+        remark: String = "",
+    ): Boolean = withContext(Dispatchers.IO) {
+        Log.d("SunmiPrintService", "开始打印预售单，检查打印机连接")
+
+        val connected = ensureConnectedForPrint()
+        if (!connected) {
+            Log.e("SunmiPrintService", "打印失败：打印机未连接")
+            throw Exception("打印机未连接，请先初始化")
+        }
+
+        try {
+            sunmiPrinterService!!.enterPrinterBuffer(true)
+
+            val configManager = ConfigManager(context)
+            val companyName = configManager.getCompanyName() ?: "平伟冷藏库"
+            printText(companyName, 1)
+
+            val title = if (saleMode == "PRESALE") "预售单" else "出库销售单"
+            printText(title, 1)
+            printSeparator()
+
+            val currentTime = SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.CHINA).format(Date())
+            printText("单据号: $billNo", 0)
+            printText("时间: $currentTime", 0)
+            printText("买家: $buyerName", 0)
+            printText("库位: $locationName", 0)
+            printText("经手人: $operatorName", 0)
+            if (remark.isNotBlank()) {
+                printText("备注: $remark", 0)
+            }
+
+            printSeparator()
+            printTextWithFont("型号   数量  单价", 0, 32)
+            printSeparator()
+
+            items.forEach { item ->
+                val line = String.format(
+                    "%-6s %-4d ¥%.1f",
+                    item.productName.take(6),
+                    item.quantity,
+                    item.salePrice
+                )
+                printTextWithFont(line, 0, 32)
+                printText("      小计: ¥${String.format("%.2f", item.amount)}", 0)
+            }
+
+            printSeparator()
+            val unpaid = (totalAmount - paidAmount).coerceAtLeast(0.0)
+            printText("合计项: ${items.size} 项", 0)
+            printTextWithFont("应收: ¥${String.format("%.2f", totalAmount)}", 0, 32)
+            printText("已收: ¥${String.format("%.2f", paidAmount)}", 0)
+            printTextWithFont("欠款: ¥${String.format("%.2f", unpaid)}", 0, 32)
+
+            printText("---", 1)
+            printText("冷库宝管理系统", 1)
+
+            val success = commitPrintWithCallback()
+            if (success) {
+                try {
+                    sunmiPrinterService!!.cutPaper(null)
+                } catch (_: Exception) {
+                }
+            }
+            success
+        } catch (e: Exception) {
+            e.printStackTrace()
+            try {
+                sunmiPrinterService!!.exitPrinterBuffer(false)
+            } catch (ex: Exception) {
+                ex.printStackTrace()
+            }
+            false
+        }
+    }
+
+    /**
+     * 打印报账单（销售出库单）
+     */
+    @SuppressLint("DefaultLocale")
+    suspend fun printSaleBill(
+        billNo: String,
+        customerName: String,
+        locationName: String,
+        operatorName: String,
+        items: List<SaleItemPrint>,
+        totalAmount: Double,
+        totalQuantity: Int,
+        remark: String = "",
+    ): Boolean = withContext(Dispatchers.IO) {
+        Log.d("SunmiPrintService", "开始打印报账单，检查打印机连接")
+
+        val connected = ensureConnectedForPrint()
+        if (!connected) {
+            throw Exception("打印机未连接，请先初始化")
+        }
+
+        try {
+            sunmiPrinterService!!.enterPrinterBuffer(true)
+
+            val configManager = ConfigManager(context)
+            val companyName = configManager.getCompanyName() ?: "平伟冷藏库"
+            printText(companyName, 1)
+            printText("报账单", 1)
+            printSeparator()
+
+            val currentTime = SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.CHINA).format(Date())
+            printText("单据号: $billNo", 0)
+            printText("时间: $currentTime", 0)
+            printText("客户: $customerName", 0)
+            printText("库位: $locationName", 0)
+            printText("经手人: $operatorName", 0)
+            if (remark.isNotBlank()) {
+                printText("备注: $remark", 0)
+            }
+
+            printSeparator()
+            printTextWithFont("型号   数量  单价", 0, 32)
+            printSeparator()
+
+            items.forEach { item ->
+                val line = String.format(
+                    "%-6s %-4d ¥%.1f",
+                    item.productName.take(6),
+                    item.quantity,
+                    item.unitPrice
+                )
+                printTextWithFont(line, 0, 32)
+                printText("      小计: ¥${String.format("%.2f", item.amount)}", 0)
+            }
+
+            printSeparator()
+            printText("合计项: ${items.size} 项", 0)
+            printTextWithFont("总数量: $totalQuantity", 0, 32)
+            printTextWithFont("总金额: ¥${String.format("%.2f", totalAmount)}", 0, 32)
+
+            printText("---", 1)
+            printText("冷库宝管理系统", 1)
+
+            val success = commitPrintWithCallback()
+            if (success) {
+                try {
+                    sunmiPrinterService!!.cutPaper(null)
+                } catch (_: Exception) {
+                }
+            }
             success
         } catch (e: Exception) {
             e.printStackTrace()
@@ -798,6 +970,85 @@ class SunmiPrintService(private val context: Context) {
             Log.w("SunmiPrintService", "断开连接时出现异常（可能是重复断开）: ${e.message}")
         } catch (e: Exception) {
             Log.e("SunmiPrintService", "断开连接失败: ${e.message}", e)
+        }
+    }
+
+    /**
+     * 打印扣款单
+     */
+    suspend fun printDeductionBill(
+        customerName: String,
+        customerNo: String,
+        quantity: Int,
+        unitPrice: Double,
+        amount: Double,
+        reason: String,
+        handler: String,
+        deductDate: String
+    ): Boolean = withContext(Dispatchers.IO) {
+        Log.d("SunmiPrintService", "开始打印扣款单: $customerName ($customerNo)")
+
+        val connected = ensureConnectedForPrint()
+        if (!connected) {
+            Log.e("SunmiPrintService", "打印失败：打印机未连接")
+            throw Exception("打印机未连接，请先初始化")
+        }
+
+        try {
+            sunmiPrinterService!!.enterPrinterBuffer(true)
+
+            val configManager = ConfigManager(context)
+            val companyName = configManager.getCompanyName() ?: "平伟冷藏库"
+            printText(companyName, 1)
+            printText("扣款单", 1)
+            printSeparator()
+
+            val currentTime = SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.CHINA).format(Date())
+            printText("时间: $currentTime", 0)
+            printText("日期: $deductDate", 0)
+            printText("客户: $customerName", 0)
+            printText("编号: $customerNo", 0)
+            printText("经手人: $handler", 0)
+
+            printSeparator()
+            printTextWithFont("数量   单价   金额", 0, 32)
+            printSeparator()
+
+            val lineContent = String.format(
+                "%-4d  ¥%-5.2f  ¥%-6.2f",
+                quantity,
+                unitPrice,
+                amount
+            )
+            printTextWithFont(lineContent, 0, 32)
+
+            if (reason.isNotBlank()) {
+                printSeparator()
+                printText("事由: $reason", 0)
+            }
+
+            printSeparator()
+            printTextWithFont("扣款金额: ¥${String.format("%.2f", amount)}", 0, 32)
+            printText("---", 1)
+            printText("冷库宝管理系统", 1)
+
+            val success = commitPrintWithCallback()
+            if (success) {
+                try {
+                    sunmiPrinterService!!.cutPaper(null)
+                } catch (e: Exception) {
+                    // 忽略切刀错误
+                }
+            }
+            success
+        } catch (e: Exception) {
+            e.printStackTrace()
+            try {
+                sunmiPrinterService!!.exitPrinterBuffer(false)
+            } catch (ex: Exception) {
+                ex.printStackTrace()
+            }
+            false
         }
     }
 

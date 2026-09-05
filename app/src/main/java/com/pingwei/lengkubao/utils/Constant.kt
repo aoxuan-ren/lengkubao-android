@@ -6,7 +6,7 @@ package com.pingwei.lengkubao.utils
 object Constant {
     // ========== UDP广播发现相关 ==========
     const val UDP_BROADCAST_PORT = 8888              // UDP广播端口
-    const val UDP_BROADCAST_TIMEOUT = 5000L          // UDP发现超时时间
+    const val UDP_BROADCAST_TIMEOUT = 8000L          // UDP发现超时时间
     const val ACTION_UDP_DISCOVERY = "com.pingwei.lengkubao.UDP_DISCOVERY"
     const val EXTRA_UDP_SERVER_NAME = "udp_server_name"
     const val EXTRA_UDP_SERVER_IP = "udp_server_ip"
@@ -36,9 +36,13 @@ object Constant {
     // SharedPreferences 键名
     const val PREF_PAIRED_SERVER_IP = "paired_server_ip"    // 已配对服务器IP
     const val PREF_PAIRED_SERVER_PORT = "paired_server_port" // 已配对服务器端口
+    const val PREF_SERVER_EVER_CONNECTED = "server_ever_connected" // 是否曾成功连上过服务器
     const val PREF_PAIRING_CODE = "pairing_code"            // 保存的配对码
     const val PREF_AUTO_CONNECT = "auto_connect_mdns"       // 是否自动连接
+    const val PREF_AUTO_SYNC = "auto_sync"                  // 是否自动后台同步
+    const val PREF_AUTO_SYNC_DEFAULT = true
     const val PREF_DISCOVERY_METHOD = "discovery_method"    // 发现方式: udp/mdns/both
+    const val PREF_SHOW_ADVANCED_SYNC = "show_advanced_sync" // 是否展开高级同步设置
 
     // 广播Action（UDP）
     const val ACTION_UDP_DEVICE_FOUND = "com.pingwei.lengkubao.UDP_DEVICE_FOUND"
@@ -126,8 +130,8 @@ object Constant {
     const val BILL_TYPE_PACKAGING = "PACKAGING"                // 包装单
 
     // 包装单标记
-    const val PACK_FLAG_TAKE = "TAKE"                          // 取包装
-    const val PACK_FLAG_RETURN = "RETURN"                      // 退包装
+    const val PACK_FLAG_TAKE = "TAKE"                          // 出包装
+    const val PACK_FLAG_RETURN = "RETURN"                      // 进包装
 
     // 默认配对码
     const val DEFAULT_PAIRING_CODE = "123456"

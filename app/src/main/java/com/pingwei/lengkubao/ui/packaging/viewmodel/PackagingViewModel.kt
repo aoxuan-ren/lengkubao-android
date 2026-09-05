@@ -4,6 +4,7 @@ import android.content.Context
 import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import androidx.room.withTransaction
 import com.pingwei.lengkubao.LengKuBaoApplication
 import com.pingwei.lengkubao.data.db.AppDatabase
 import com.pingwei.lengkubao.data.db.entity.*
@@ -13,6 +14,7 @@ import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 import java.text.SimpleDateFormat
 import java.util.*
+import android.database.sqlite.SQLiteConstraintException
 
 // 包装项数据类
 data class PackagingInputItem(
@@ -48,8 +50,8 @@ class PackagingViewModel(application: android.app.Application) : AndroidViewMode
     private val _selectedOperator = MutableStateFlow<Operator?>(null)
     val selectedOperator: StateFlow<Operator?> = _selectedOperator.asStateFlow()
 
-    // 【新增】包装类型标记（取包装/退包装）
-    private val _packagingTypeFlag = MutableStateFlow("TAKE") // TAKE-取包装, RETURN-退包装
+    // 【新增】包装类型标记（出包装/进包装）
+    private val _packagingTypeFlag = MutableStateFlow("TAKE") // TAKE-出包装, RETURN-进包装
     val packagingTypeFlag: StateFlow<String> = _packagingTypeFlag.asStateFlow()
 
     // 包装项输入列表
@@ -74,7 +76,7 @@ class PackagingViewModel(application: android.app.Application) : AndroidViewMode
             _packagingTypeFlag
         ) { inputs, flag ->
             val rawTotal = inputs.sumOf { it.calculateSubtotal() }
-            // 退包装时总金额为负值
+            // 进包装时总金额为负值
             if (flag == "RETURN") -rawTotal else rawTotal
         }.stateIn(
             viewModelScope,
@@ -84,7 +86,7 @@ class PackagingViewModel(application: android.app.Application) : AndroidViewMode
 
     // ===== 数据流 =====
     val allOperators = database.operatorDao().getAllOperators()
-    val allCustomers = database.customerDao().getAllCustomers()
+    val allCustomers = database.customerDao().getCustomersByType(CustomerType.SELLER)
 
     // ===== 初始化 =====
     init {
@@ -278,13 +280,6 @@ class PackagingViewModel(application: android.app.Application) : AndroidViewMode
                 return Result.failure(IllegalStateException(validationError))
             }
 
-            // 生成单据号
-            val billNo = generateBillNo()
-            val now = System.currentTimeMillis()
-            val dateFormat = SimpleDateFormat("yyyy-MM-dd", Locale.CHINA)
-            val billDate = dateFormat.format(Date(now))
-
-            // 创建包装单主表
             val customer = _selectedCustomer.value!!
             val operator = _selectedOperator.value!!
             val flag = _packagingTypeFlag.value
@@ -293,53 +288,16 @@ class PackagingViewModel(application: android.app.Application) : AndroidViewMode
             val rawTotal = _packagingInputs.value.sumOf { it.calculateSubtotal() }
             val finalTotalAmount = if (flag == "RETURN") -rawTotal else rawTotal
 
-            val bill = PackagingBill(
-                billNo = billNo,
-                customerId = customer.id,
-                customerNo = customer.customerNo,
-                customerName = customer.customerName,
-                operatorId = operator.id,
-                operatorName = operator.name,
-                totalAmount = finalTotalAmount,
-                createTime = now,
-                billDate = billDate,
-                packagingTypeFlag = flag, // 【新增】保存包装类型标记
+            val itemInputs = _packagingInputs.value.filter { it.quantity > 0 }
+
+            val (billId, billNo) = insertBillInTransaction(
+                customer = customer,
+                operator = operator,
+                flag = flag,
+                finalTotalAmount = finalTotalAmount,
                 remark = _remark.value,
-                isSynced = false // 标记为未同步
+                itemInputs = itemInputs,
             )
-
-            // 保存包装单
-            val billId = database.packagingBillDao().insert(bill)
-            if (billId <= 0) {
-                return Result.failure(Exception("包装单保存失败"))
-            }
-
-            // 保存包装单明细
-            val items = _packagingInputs.value
-                .filter { it.quantity > 0 }
-                .map { inputItem ->
-                    val calculatedAmount = inputItem.calculateSubtotal()
-                    // 明细金额也根据标记调整
-                    val finalItemAmount = if (flag == "RETURN") -calculatedAmount else calculatedAmount
-
-                    PackagingItem(
-                        billId = billId,
-                        packagingTypeFlag = flag, // 【新增】保存明细级别的标记
-                        packagingType = inputItem.packagingType.typeName,
-                        packagingTypeId = inputItem.packagingType.id,
-                        packagingTypeNo = inputItem.packagingType.typeNo,
-                        packagingTypeName = inputItem.packagingType.typeName,
-                        unitPrice = inputItem.unitPrice,
-                        quantity = inputItem.quantity,
-                        subtotal = finalItemAmount,
-                        amount = finalItemAmount,
-                        unit = inputItem.packagingType.unit
-                    )
-                }
-
-            if (items.isNotEmpty()) {
-                database.packagingItemDao().insertAll(items)
-            }
 
             Log.d(TAG, "✅ 包装单保存成功: $billNo, ID: $billId, 类型: $flag, 金额: $finalTotalAmount")
             Result.success(Pair(billId, billNo))
@@ -347,6 +305,105 @@ class PackagingViewModel(application: android.app.Application) : AndroidViewMode
             Log.e(TAG, "❌ 包装单保存失败: ${e.message}", e)
             Result.failure(e)
         }
+    }
+
+    /**
+     * 在事务内生成单号并写入主表/明细，配合 bill_no 唯一索引避免并发重复单号。
+     */
+    private suspend fun insertBillInTransaction(
+        customer: Customer,
+        operator: Operator,
+        flag: String,
+        finalTotalAmount: Double,
+        remark: String,
+        itemInputs: List<PackagingInputItem>,
+    ): Pair<Long, String> {
+        var lastError: Exception? = null
+        for (attempt in 0 until MAX_BILL_NO_INSERT_ATTEMPTS) {
+            try {
+                return database.withTransaction {
+                    val now = System.currentTimeMillis()
+                    val dateFormat = SimpleDateFormat("yyyy-MM-dd", Locale.CHINA)
+                    val billDate = dateFormat.format(Date(now))
+                    val billNo = generateBillNoInTransaction(now)
+
+                    val bill = PackagingBill(
+                        billNo = billNo,
+                        customerId = customer.id,
+                        customerNo = customer.customerNo,
+                        customerName = customer.customerName,
+                        operatorId = operator.id,
+                        operatorName = operator.name,
+                        totalAmount = finalTotalAmount,
+                        createTime = now,
+                        billDate = billDate,
+                        packagingTypeFlag = flag,
+                        remark = remark,
+                        isSynced = false,
+                    )
+
+                    val billId = database.packagingBillDao().insert(bill)
+                    if (billId <= 0) {
+                        throw IllegalStateException("包装单保存失败")
+                    }
+
+                    if (itemInputs.isNotEmpty()) {
+                        val items = itemInputs.map { inputItem ->
+                            val calculatedAmount = inputItem.calculateSubtotal()
+                            val finalItemAmount = if (flag == "RETURN") -calculatedAmount else calculatedAmount
+                            PackagingItem(
+                                billId = billId,
+                                packagingTypeFlag = flag,
+                                packagingType = inputItem.packagingType.typeName,
+                                packagingTypeId = inputItem.packagingType.id,
+                                packagingTypeName = inputItem.packagingType.typeName,
+                                unitPrice = inputItem.unitPrice,
+                                quantity = inputItem.quantity,
+                                subtotal = finalItemAmount,
+                                amount = finalItemAmount,
+                                unit = inputItem.packagingType.unit,
+                            )
+                        }
+                        database.packagingItemDao().insertAll(items)
+                    }
+
+                    Pair(billId, billNo)
+                }
+            } catch (e: Exception) {
+                if (!isBillNoUniqueViolation(e)) {
+                    throw e
+                }
+                lastError = e
+                Log.w(TAG, "⚠️ 包装单号冲突，重试 (${attempt + 1}/$MAX_BILL_NO_INSERT_ATTEMPTS): ${e.message}")
+            }
+        }
+        throw lastError ?: IllegalStateException("包装单保存失败：单号冲突")
+    }
+
+    private fun isBillNoUniqueViolation(e: Exception): Boolean {
+        if (e is SQLiteConstraintException) return true
+        val cause = e.cause
+        if (cause is SQLiteConstraintException) return true
+        val message = e.message.orEmpty()
+        return message.contains("UNIQUE constraint failed", ignoreCase = true) &&
+            message.contains("bill_no", ignoreCase = true)
+    }
+
+    private suspend fun generateBillNoInTransaction(todayMillis: Long): String {
+        val date = SimpleDateFormat("yyyyMMdd", Locale.CHINA).format(Date(todayMillis))
+        val prefix = "BZ$date"
+        val maxSeq = database.packagingBillDao().getBillNosWithPrefix(prefix)
+            .mapNotNull { billNo ->
+                val suffix = billNo.removePrefix(prefix)
+                suffix.takeWhile { it.isDigit() }.toIntOrNull()
+            }
+            .maxOrNull() ?: 0
+        val sequence = maxSeq + 1
+        return "$prefix${String.format(Locale.CHINA, "%04d", sequence)}"
+    }
+
+    companion object {
+        private const val MAX_BILL_NO_INSERT_ATTEMPTS = 5
     }
 
     // 重新加载默认经手人
@@ -373,19 +430,6 @@ class PackagingViewModel(application: android.app.Application) : AndroidViewMode
                 _selectedOperator.value = null
             }
         }
-    }
-
-    // 生成单据号 BZ + 年月日 + 4位流水号
-    private suspend fun generateBillNo(): String {
-        val date = SimpleDateFormat("yyyyMMdd", Locale.CHINA).format(Date())
-        val sequence = getNextBillSequence()
-        return "BZ$date${String.format("%04d", sequence)}"
-    }
-
-    private suspend fun getNextBillSequence(): Int {
-        val today = System.currentTimeMillis()
-        val count = database.packagingBillDao().getTodayBillCount(today)
-        return count + 1
     }
 
     // ===== 清除默认值 =====

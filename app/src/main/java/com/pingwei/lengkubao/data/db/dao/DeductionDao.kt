@@ -73,6 +73,9 @@ interface DeductionDao {
     @Query("SELECT SUM(amount) FROM deductions WHERE status = 1")
     suspend fun getTotalAllDeductions(): Double?
 
+    @Query("SELECT * FROM deductions WHERE create_time BETWEEN :startTime AND :endTime ORDER BY create_time DESC, id DESC")
+    suspend fun getByCreateTimeRange(startTime: Long, endTime: Long): List<Deduction>
+
     @Query("UPDATE deductions SET sync_status = 0, sync_time = NULL WHERE create_time BETWEEN :startTime AND :endTime")
     suspend fun resetSyncStatusByCreateTimeRange(startTime: Long, endTime: Long): Int
 }

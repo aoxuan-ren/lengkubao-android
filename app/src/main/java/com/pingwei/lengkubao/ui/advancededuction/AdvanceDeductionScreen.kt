@@ -1,12 +1,13 @@
 package com.pingwei.lengkubao.ui.advancededuction
 
 import android.app.Activity
+import android.widget.Toast
 import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
+import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
@@ -14,35 +15,25 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.pingwei.lengkubao.data.db.entity.Customer
 import com.pingwei.lengkubao.data.db.entity.Operator
+import com.pingwei.lengkubao.service.SunmiPrintService
 import com.pingwei.lengkubao.ui.advancededuction.viewmodel.AdvanceDeductionViewModel
+import com.pingwei.lengkubao.ui.instock.components.CompactSelectField
+import com.pingwei.lengkubao.ui.instock.components.OperatorSelectorDialog
 import com.pingwei.lengkubao.ui.instock.components.SearchableCustomerField
-import com.pingwei.lengkubao.ui.instock.components.SearchableOperatorField
 
-private val AdvanceCompactFieldHeight = 64.dp
-private val AdvanceCompactMultiLineFieldHeight = 88.dp
-private val AdvanceSectionTitleSize = 16.sp
-private val AdvanceInputFontSize = 15.sp
-private val AdvanceLabelFontSize = 13.sp
-
-@Composable
-private fun advanceFieldTextStyle() =
-    MaterialTheme.typography.bodyMedium.copy(
-        fontSize = AdvanceInputFontSize,
-        lineHeight = 22.sp
-    )
-
-@Composable
-private fun advanceFieldLabelStyle() =
-    MaterialTheme.typography.labelMedium.copy(fontSize = AdvanceLabelFontSize)
+private val CompactFieldHeight = 40.dp
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -54,22 +45,78 @@ fun AdvanceDeductionScreen(
     val selectedCustomer by viewModel.selectedCustomer.collectAsState()
     val operators by viewModel.operators.collectAsState()
     val isLoading by viewModel.isLoading.collectAsState()
+    val lastSavedDeduction by viewModel.lastSavedDeduction.collectAsState()
 
     var advanceAmount by remember { mutableStateOf("") }
     var advanceReason by remember { mutableStateOf("") }
     var selectedAdvanceOperator by remember { mutableStateOf<Operator?>(null) }
+    var showAdvanceOperatorDialog by remember { mutableStateOf(false) }
 
-    var deductionAmount by remember { mutableStateOf("") }
+    var deductionQuantity by remember { mutableStateOf("") }
+    var deductionUnitPrice by remember { mutableStateOf("") }
     var deductionReason by remember { mutableStateOf("") }
     var selectedDeductionOperator by remember { mutableStateOf<Operator?>(null) }
+    var showDeductionOperatorDialog by remember { mutableStateOf(false) }
+
+    val calculatedDeductionAmount = remember(deductionQuantity, deductionUnitPrice) {
+        val quantity = deductionQuantity.toIntOrNull() ?: 0
+        val unitPrice = deductionUnitPrice.toDoubleOrNull() ?: 0.0
+        quantity * unitPrice
+    }
+
+    LaunchedEffect(lastSavedDeduction) {
+        val deduction = lastSavedDeduction ?: return@LaunchedEffect
+        try {
+            val printService = SunmiPrintService.getInstance(context)
+            val success = printService.printDeductionBill(
+                customerName = deduction.customerName,
+                customerNo = deduction.customerNo,
+                quantity = deduction.quantity,
+                unitPrice = deduction.unitPrice,
+                amount = deduction.amount,
+                reason = deduction.reason ?: "",
+                handler = deduction.handler ?: "",
+                deductDate = deduction.deductDate
+            )
+            if (success) {
+                Toast.makeText(context, "扣款单打印成功", Toast.LENGTH_SHORT).show()
+            } else {
+                Toast.makeText(context, "扣款已保存，但打印失败", Toast.LENGTH_SHORT).show()
+            }
+        } catch (e: Exception) {
+            Toast.makeText(context, "扣款已保存，打印失败: ${e.message}", Toast.LENGTH_SHORT).show()
+        }
+        viewModel.clearLastSavedDeduction()
+    }
+
+    if (showAdvanceOperatorDialog) {
+        OperatorSelectorDialog(
+            operators = operators,
+            onDismiss = { showAdvanceOperatorDialog = false },
+            onOperatorSelected = {
+                selectedAdvanceOperator = it
+                showAdvanceOperatorDialog = false
+            }
+        )
+    }
+    if (showDeductionOperatorDialog) {
+        OperatorSelectorDialog(
+            operators = operators,
+            onDismiss = { showDeductionOperatorDialog = false },
+            onOperatorSelected = {
+                selectedDeductionOperator = it
+                showDeductionOperatorDialog = false
+            }
+        )
+    }
 
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("\u9884\u652f\u4e0e\u6263\u6b3e") },
+                title = { Text("预支与扣款") },
                 navigationIcon = {
                     IconButton(onClick = { (context as? Activity)?.finish() }) {
-                        Icon(Icons.Default.ArrowBack, contentDescription = "\u8fd4\u56de")
+                        Icon(Icons.Default.ArrowBack, contentDescription = "返回")
                     }
                 },
                 colors = TopAppBarDefaults.topAppBarColors(
@@ -87,24 +134,8 @@ fun AdvanceDeductionScreen(
             verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
             item {
-                Card(
-                    modifier = Modifier.fillMaxWidth(),
-                    colors = CardDefaults.cardColors(
-                        containerColor = MaterialTheme.colorScheme.surfaceVariant
-                    )
-                ) {
-                    Column(
-                        modifier = Modifier.padding(10.dp)
-                    ) {
-                        Text(
-                            text = "1. \u9009\u62e9\u5ba2\u6237",
-                            fontSize = AdvanceSectionTitleSize,
-                            fontWeight = FontWeight.Bold,
-                            color = MaterialTheme.colorScheme.primary
-                        )
-
-                        Spacer(modifier = Modifier.height(6.dp))
-
+                Card(modifier = Modifier.fillMaxWidth()) {
+                    Column(modifier = Modifier.padding(10.dp)) {
                         if (selectedCustomer != null) {
                             SelectedCustomerCard(
                                 customer = selectedCustomer!!,
@@ -115,11 +146,13 @@ fun AdvanceDeductionScreen(
                                 customers = allCustomers,
                                 selectedCustomer = null,
                                 onCustomerSelected = { viewModel.selectCustomer(it) },
-                                label = "\u641c\u7d22\u5ba2\u6237",
                                 modifier = Modifier.fillMaxWidth(),
-                                fieldHeight = AdvanceCompactFieldHeight,
-                                fieldTextStyle = advanceFieldTextStyle(),
-                                fieldLabelStyle = advanceFieldLabelStyle()
+                                fieldHeight = CompactFieldHeight,
+                                fieldTextStyle = MaterialTheme.typography.bodyMedium.copy(
+                                    fontSize = 15.sp,
+                                    fontWeight = FontWeight.Medium
+                                ),
+                                showFloatingLabel = false
                             )
                         }
                     }
@@ -130,16 +163,13 @@ fun AdvanceDeductionScreen(
                 item {
                     Card(
                         modifier = Modifier.fillMaxWidth(),
-                        colors = CardDefaults.cardColors(
-                            containerColor = Color(0xFFE3F2FD)
-                        )
+                        colors = CardDefaults.cardColors(containerColor = Color(0xFFE3F2FD))
                     ) {
                         Column(
-                            modifier = Modifier.padding(10.dp)
+                            modifier = Modifier.padding(10.dp),
+                            verticalArrangement = Arrangement.spacedBy(8.dp)
                         ) {
-                            Row(
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
                                 Icon(
                                     Icons.Default.AttachMoney,
                                     contentDescription = null,
@@ -148,49 +178,37 @@ fun AdvanceDeductionScreen(
                                 )
                                 Spacer(modifier = Modifier.width(6.dp))
                                 Text(
-                                    text = "2. \u65b0\u589e\u9884\u652f",
-                                    fontSize = AdvanceSectionTitleSize,
+                                    text = "新增预支",
+                                    fontSize = 16.sp,
                                     fontWeight = FontWeight.Bold,
                                     color = Color(0xFF1976D2)
                                 )
                             }
 
-                            Spacer(modifier = Modifier.height(8.dp))
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                CompactAmountField(
+                                    value = advanceAmount,
+                                    onValueChange = { advanceAmount = it },
+                                    modifier = Modifier.weight(1f)
+                                )
+                                CompactSelectField(
+                                    text = selectedAdvanceOperator?.name.orEmpty(),
+                                    placeholder = "请选择",
+                                    isError = selectedAdvanceOperator == null,
+                                    onClick = { showAdvanceOperatorDialog = true },
+                                    modifier = Modifier.weight(1f)
+                                )
+                            }
 
-                            AdvanceCompactOutlinedTextField(
-                                value = advanceAmount,
-                                onValueChange = { advanceAmount = it },
-                                label = "\u9884\u652f\u91d1\u989d",
-                                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
-                                leadingIcon = {
-                                    Text("\u00a5", style = advanceFieldTextStyle())
-                                }
-                            )
-
-                            Spacer(modifier = Modifier.height(4.dp))
-
-                            AdvanceCompactOutlinedTextField(
+                            CompactReasonField(
                                 value = advanceReason,
                                 onValueChange = { advanceReason = it },
-                                label = "\u9884\u652f\u4e8b\u7531",
-                                singleLine = false,
-                                autoHeight = true
+                                placeholder = "预支事由（可选）"
                             )
-
-                            Spacer(modifier = Modifier.height(4.dp))
-
-                            SearchableOperatorField(
-                                operators = operators,
-                                selectedOperator = selectedAdvanceOperator,
-                                onOperatorSelected = { selectedAdvanceOperator = it },
-                                label = "\u9009\u62e9\u7ecf\u624b\u4eba",
-                                modifier = Modifier.fillMaxWidth(),
-                                fieldHeight = AdvanceCompactFieldHeight,
-                                fieldTextStyle = advanceFieldTextStyle(),
-                                fieldLabelStyle = advanceFieldLabelStyle()
-                            )
-
-                            Spacer(modifier = Modifier.height(8.dp))
 
                             Button(
                                 onClick = {
@@ -211,8 +229,8 @@ fun AdvanceDeductionScreen(
                                 },
                                 modifier = Modifier.fillMaxWidth(),
                                 enabled = advanceAmount.isNotBlank() &&
-                                        advanceAmount.toDoubleOrNull() ?: 0.0 > 0 &&
-                                        selectedAdvanceOperator != null
+                                    (advanceAmount.toDoubleOrNull() ?: 0.0) > 0 &&
+                                    selectedAdvanceOperator != null
                             ) {
                                 if (isLoading) {
                                     CircularProgressIndicator(
@@ -220,7 +238,7 @@ fun AdvanceDeductionScreen(
                                         color = Color.White
                                     )
                                 } else {
-                                    Text("\u4fdd\u5b58\u9884\u652f\u8bb0\u5f55")
+                                    Text("保存预支记录")
                                 }
                             }
                         }
@@ -230,16 +248,13 @@ fun AdvanceDeductionScreen(
                 item {
                     Card(
                         modifier = Modifier.fillMaxWidth(),
-                        colors = CardDefaults.cardColors(
-                            containerColor = Color(0xFFFFEBEE)
-                        )
+                        colors = CardDefaults.cardColors(containerColor = Color(0xFFFFEBEE))
                     ) {
                         Column(
-                            modifier = Modifier.padding(10.dp)
+                            modifier = Modifier.padding(10.dp),
+                            verticalArrangement = Arrangement.spacedBy(8.dp)
                         ) {
-                            Row(
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
                                 Icon(
                                     Icons.Default.RemoveCircle,
                                     contentDescription = null,
@@ -248,63 +263,83 @@ fun AdvanceDeductionScreen(
                                 )
                                 Spacer(modifier = Modifier.width(6.dp))
                                 Text(
-                                    text = "3. \u65b0\u589e\u6263\u6b3e",
-                                    fontSize = AdvanceSectionTitleSize,
+                                    text = "新增扣款",
+                                    fontSize = 16.sp,
                                     fontWeight = FontWeight.Bold,
                                     color = Color(0xFFC62828)
                                 )
                             }
 
-                            Spacer(modifier = Modifier.height(8.dp))
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                CompactLabeledNumberField(
+                                    value = deductionQuantity,
+                                    onValueChange = { deductionQuantity = it },
+                                    label = "数量",
+                                    keyboardType = KeyboardType.Number,
+                                    modifier = Modifier.weight(1f)
+                                )
+                                CompactLabeledNumberField(
+                                    value = deductionUnitPrice,
+                                    onValueChange = { deductionUnitPrice = it },
+                                    label = "单价",
+                                    keyboardType = KeyboardType.Decimal,
+                                    showYen = true,
+                                    modifier = Modifier.weight(1f)
+                                )
+                            }
 
-                            AdvanceCompactOutlinedTextField(
-                                value = deductionAmount,
-                                onValueChange = { deductionAmount = it },
-                                label = "\u6263\u6b3e\u91d1\u989d",
-                                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
-                                leadingIcon = {
-                                    Text("\u00a5", style = advanceFieldTextStyle())
-                                }
-                            )
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                CompactSelectField(
+                                    text = selectedDeductionOperator?.name.orEmpty(),
+                                    placeholder = "请选择",
+                                    isError = selectedDeductionOperator == null,
+                                    onClick = { showDeductionOperatorDialog = true },
+                                    modifier = Modifier.weight(1f)
+                                )
+                                Text(
+                                    text = if (calculatedDeductionAmount > 0) {
+                                        String.format("%.2f", calculatedDeductionAmount)
+                                    } else {
+                                        "0.00"
+                                    },
+                                    style = MaterialTheme.typography.titleMedium.copy(
+                                        fontWeight = FontWeight.Bold,
+                                        color = Color(0xFFC62828)
+                                    )
+                                )
+                            }
 
-                            Spacer(modifier = Modifier.height(4.dp))
-
-                            AdvanceCompactOutlinedTextField(
+                            CompactReasonField(
                                 value = deductionReason,
                                 onValueChange = { deductionReason = it },
-                                label = "\u6263\u6b3e\u4e8b\u7531",
-                                singleLine = false,
-                                autoHeight = true
+                                placeholder = "扣款事由（可选）"
                             )
-
-                            Spacer(modifier = Modifier.height(4.dp))
-
-                            SearchableOperatorField(
-                                operators = operators,
-                                selectedOperator = selectedDeductionOperator,
-                                onOperatorSelected = { selectedDeductionOperator = it },
-                                label = "\u9009\u62e9\u7ecf\u624b\u4eba",
-                                modifier = Modifier.fillMaxWidth(),
-                                fieldHeight = AdvanceCompactFieldHeight,
-                                fieldTextStyle = advanceFieldTextStyle(),
-                                fieldLabelStyle = advanceFieldLabelStyle()
-                            )
-
-                            Spacer(modifier = Modifier.height(8.dp))
 
                             Button(
                                 onClick = {
-                                    if (deductionAmount.isNotBlank() && selectedDeductionOperator != null) {
+                                    val quantity = deductionQuantity.toIntOrNull() ?: 0
+                                    val unitPrice = deductionUnitPrice.toDoubleOrNull() ?: 0.0
+                                    if (quantity > 0 && unitPrice > 0 && selectedDeductionOperator != null) {
                                         viewModel.addDeduction(
                                             customerNo = selectedCustomer!!.customerNo,
                                             customerName = selectedCustomer!!.customerName,
-                                            amount = deductionAmount.toDoubleOrNull() ?: 0.0,
+                                            quantity = quantity,
+                                            unitPrice = unitPrice,
+                                            amount = calculatedDeductionAmount,
                                             reason = deductionReason,
                                             handler = selectedDeductionOperator!!.name,
                                             creator = selectedDeductionOperator!!.name,
                                             operatorId = selectedDeductionOperator!!.id
                                         )
-                                        deductionAmount = ""
+                                        deductionQuantity = ""
+                                        deductionUnitPrice = ""
                                         deductionReason = ""
                                         selectedDeductionOperator = null
                                     }
@@ -313,9 +348,8 @@ fun AdvanceDeductionScreen(
                                 colors = ButtonDefaults.buttonColors(
                                     containerColor = Color(0xFFC62828)
                                 ),
-                                enabled = deductionAmount.isNotBlank() &&
-                                        deductionAmount.toDoubleOrNull() ?: 0.0 > 0 &&
-                                        selectedDeductionOperator != null
+                                enabled = calculatedDeductionAmount > 0 &&
+                                    selectedDeductionOperator != null
                             ) {
                                 if (isLoading) {
                                     CircularProgressIndicator(
@@ -323,7 +357,7 @@ fun AdvanceDeductionScreen(
                                         color = Color.White
                                     )
                                 } else {
-                                    Text("\u4fdd\u5b58\u6263\u6b3e\u8bb0\u5f55")
+                                    Text("保存扣款记录")
                                 }
                             }
                         }
@@ -342,38 +376,157 @@ fun AdvanceDeductionScreen(
 }
 
 @Composable
+private fun CompactAmountField(
+    value: String,
+    onValueChange: (String) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    BasicTextField(
+        value = value,
+        onValueChange = onValueChange,
+        singleLine = true,
+        textStyle = TextStyle(
+            fontSize = 16.sp,
+            fontWeight = FontWeight.Bold,
+            color = MaterialTheme.colorScheme.onSurface
+        ),
+        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+        cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
+        modifier = modifier.height(CompactFieldHeight),
+        decorationBox = { innerTextField ->
+            Row(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .clip(MaterialTheme.shapes.small)
+                    .border(1.dp, MaterialTheme.colorScheme.outline, MaterialTheme.shapes.small)
+                    .padding(horizontal = 10.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text("¥", style = MaterialTheme.typography.bodyMedium)
+                Spacer(modifier = Modifier.width(4.dp))
+                Box(modifier = Modifier.weight(1f)) {
+                    if (value.isEmpty()) {
+                        Text(
+                            "金额",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    innerTextField()
+                }
+            }
+        }
+    )
+}
+
+@Composable
+private fun CompactLabeledNumberField(
+    value: String,
+    onValueChange: (String) -> Unit,
+    label: String,
+    keyboardType: KeyboardType,
+    modifier: Modifier = Modifier,
+    showYen: Boolean = false,
+) {
+    BasicTextField(
+        value = value,
+        onValueChange = onValueChange,
+        singleLine = true,
+        textStyle = TextStyle(
+            fontSize = 15.sp,
+            fontWeight = FontWeight.Medium,
+            color = MaterialTheme.colorScheme.onSurface
+        ),
+        keyboardOptions = KeyboardOptions(keyboardType = keyboardType),
+        cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
+        modifier = modifier.height(CompactFieldHeight),
+        decorationBox = { innerTextField ->
+            Row(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .clip(MaterialTheme.shapes.small)
+                    .border(1.dp, MaterialTheme.colorScheme.outline, MaterialTheme.shapes.small)
+                    .padding(horizontal = 10.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    label,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Spacer(modifier = Modifier.width(6.dp))
+                if (showYen) {
+                    Text("¥", style = MaterialTheme.typography.bodyMedium)
+                    Spacer(modifier = Modifier.width(2.dp))
+                }
+                Box(modifier = Modifier.weight(1f), contentAlignment = Alignment.CenterEnd) {
+                    innerTextField()
+                }
+            }
+        }
+    )
+}
+
+@Composable
+private fun CompactReasonField(
+    value: String,
+    onValueChange: (String) -> Unit,
+    placeholder: String,
+) {
+    BasicTextField(
+        value = value,
+        onValueChange = onValueChange,
+        singleLine = true,
+        textStyle = TextStyle(
+            fontSize = 14.sp,
+            color = MaterialTheme.colorScheme.onSurface
+        ),
+        cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(36.dp),
+        decorationBox = { innerTextField ->
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .clip(MaterialTheme.shapes.small)
+                    .border(1.dp, MaterialTheme.colorScheme.outline, MaterialTheme.shapes.small)
+                    .padding(horizontal = 10.dp),
+                contentAlignment = Alignment.CenterStart
+            ) {
+                if (value.isEmpty()) {
+                    Text(
+                        placeholder,
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                innerTextField()
+            }
+        }
+    )
+}
+
+@Composable
 fun SelectedCustomerCard(
     customer: Customer,
     onClear: () -> Unit
 ) {
-    Card(
+    Row(
         modifier = Modifier.fillMaxWidth(),
-        colors = CardDefaults.cardColors(
-            containerColor = MaterialTheme.colorScheme.primaryContainer
-        )
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.SpaceBetween
     ) {
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(8.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.SpaceBetween
-        ) {
-            Column {
-                Text(
-                    text = customer.customerName,
-                    fontSize = AdvanceSectionTitleSize,
-                    fontWeight = FontWeight.Bold
-                )
-                Text(
-                    text = "\u7f16\u53f7: ${customer.customerNo}",
-                    fontSize = 12.sp,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-            }
-            IconButton(onClick = onClear) {
-                Icon(Icons.Default.Close, contentDescription = "\u66f4\u6362\u5ba2\u6237")
-            }
+        Text(
+            text = customer.customerName,
+            fontSize = 16.sp,
+            fontWeight = FontWeight.Bold,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.weight(1f)
+        )
+        IconButton(onClick = onClear, modifier = Modifier.size(32.dp)) {
+            Icon(Icons.Default.Close, contentDescription = "更换客户", modifier = Modifier.size(20.dp))
         }
     }
 }
@@ -398,7 +551,7 @@ fun RecentRecordsSection(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Text(
-                    text = "\u6700\u8fd1\u8bb0\u5f55",
+                    text = "最近记录",
                     fontSize = 16.sp,
                     fontWeight = FontWeight.Bold
                 )
@@ -415,7 +568,7 @@ fun RecentRecordsSection(
 
             if (advances.isEmpty() && deductions.isEmpty()) {
                 Text(
-                    text = "\u6682\u65e0\u9884\u652f\u548c\u6263\u6b3e\u8bb0\u5f55",
+                    text = "暂无预支和扣款记录",
                     fontSize = 14.sp,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(vertical = 4.dp)
@@ -423,7 +576,7 @@ fun RecentRecordsSection(
             } else {
                 advances.take(3).forEach { advance ->
                     RecentRecordItem(
-                        type = "\u9884\u652f",
+                        type = "预支",
                         amount = advance.amount,
                         date = advance.advanceDate,
                         reason = advance.reason ?: "",
@@ -434,7 +587,7 @@ fun RecentRecordsSection(
 
                 deductions.take(3).forEach { deduction ->
                     RecentRecordItem(
-                        type = "\u6263\u6b3e",
+                        type = "扣款",
                         amount = deduction.amount,
                         date = deduction.deductDate,
                         reason = deduction.reason ?: "",
@@ -462,7 +615,7 @@ fun SyncStatusLegend() {
             )
             Spacer(modifier = Modifier.width(2.dp))
             Text(
-                text = "\u5df2\u540c\u6b65",
+                text = "已同步",
                 fontSize = 10.sp,
                 color = Color(0xFF4CAF50)
             )
@@ -477,7 +630,7 @@ fun SyncStatusLegend() {
             )
             Spacer(modifier = Modifier.width(2.dp))
             Text(
-                text = "\u672a\u540c\u6b65",
+                text = "未同步",
                 fontSize = 10.sp,
                 color = Color(0xFFFF9800)
             )
@@ -516,7 +669,7 @@ fun RecentRecordItem(
                 horizontalArrangement = Arrangement.spacedBy(4.dp)
             ) {
                 Text(
-                    text = "$type: \u00a5${String.format("%.2f", amount)}",
+                    text = "$type: ¥${String.format("%.2f", amount)}",
                     fontWeight = FontWeight.Medium
                 )
 
@@ -524,7 +677,7 @@ fun RecentRecordItem(
                     0 -> {
                         Icon(
                             Icons.Default.Sync,
-                            contentDescription = "\u672a\u540c\u6b65",
+                            contentDescription = "未同步",
                             modifier = Modifier.size(14.dp),
                             tint = Color(0xFFFF9800)
                         )
@@ -532,7 +685,7 @@ fun RecentRecordItem(
                     1 -> {
                         Icon(
                             Icons.Default.CheckCircle,
-                            contentDescription = "\u5df2\u540c\u6b65",
+                            contentDescription = "已同步",
                             modifier = Modifier.size(14.dp),
                             tint = Color(0xFF4CAF50)
                         )
@@ -540,7 +693,7 @@ fun RecentRecordItem(
                     2 -> {
                         Icon(
                             Icons.Default.Sync,
-                            contentDescription = "\u540c\u6b65\u4e2d",
+                            contentDescription = "同步中",
                             modifier = Modifier.size(14.dp),
                             tint = Color(0xFF2196F3)
                         )
@@ -548,7 +701,7 @@ fun RecentRecordItem(
                     3 -> {
                         Icon(
                             Icons.Default.Error,
-                            contentDescription = "\u540c\u6b65\u5931\u8d25",
+                            contentDescription = "同步失败",
                             modifier = Modifier.size(14.dp),
                             tint = Color(0xFFF44336)
                         )
@@ -574,59 +727,6 @@ fun RecentRecordItem(
 }
 
 @Composable
-private fun AdvanceCompactOutlinedTextField(
-    value: String,
-    onValueChange: (String) -> Unit,
-    label: String,
-    modifier: Modifier = Modifier,
-    readOnly: Boolean = false,
-    singleLine: Boolean = true,
-    autoHeight: Boolean = false,
-    minLines: Int = 1,
-    maxLines: Int = when {
-        singleLine -> 1
-        autoHeight -> 5
-        else -> 2
-    },
-    keyboardOptions: KeyboardOptions = KeyboardOptions.Default,
-    leadingIcon: @Composable (() -> Unit)? = null,
-    trailingIcon: @Composable (() -> Unit)? = null
-) {
-    val inputStyle = advanceFieldTextStyle()
-    val labelStyle = advanceFieldLabelStyle()
-
-    val heightModifier = when {
-        singleLine -> Modifier.height(AdvanceCompactFieldHeight)
-        autoHeight -> Modifier.heightIn(min = AdvanceCompactFieldHeight)
-        else -> Modifier.height(AdvanceCompactMultiLineFieldHeight)
-    }
-
-    OutlinedTextField(
-        value = value,
-        onValueChange = onValueChange,
-        label = {
-            Text(
-                label,
-                style = labelStyle,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis
-            )
-        },
-        textStyle = inputStyle,
-        modifier = modifier
-            .fillMaxWidth()
-            .then(heightModifier),
-        readOnly = readOnly,
-        singleLine = singleLine,
-        minLines = if (!singleLine) minLines else 1,
-        maxLines = maxLines,
-        keyboardOptions = keyboardOptions,
-        leadingIcon = leadingIcon,
-        trailingIcon = trailingIcon
-    )
-}
-
-@Composable
 fun RecordDetailDialog(
     record: Any?,
     onDismiss: () -> Unit
@@ -634,44 +734,54 @@ fun RecordDetailDialog(
     if (record != null) {
         AlertDialog(
             onDismissRequest = onDismiss,
-            title = { Text("\u8bb0\u5f55\u8be6\u60c5") },
+            title = { Text("记录详情") },
             text = {
                 Column {
                     when (record) {
                         is com.pingwei.lengkubao.data.db.entity.Advance -> {
-                            DetailRow("\u5ba2\u6237", "${record.customerName} (${record.customerNo})")
-                            DetailRow("\u91d1\u989d", "\u00a5${String.format("%.2f", record.amount)}")
-                            DetailRow("\u65e5\u671f", record.advanceDate)
-                            DetailRow("\u4e8b\u7531", record.reason ?: "-")
-                            DetailRow("\u7ecf\u624b\u4eba", record.handler ?: "-")
-                            DetailRow("\u540c\u6b65\u72b6\u6001", when(record.syncStatus) {
-                                0 -> "\u672a\u540c\u6b65"
-                                1 -> "\u5df2\u540c\u6b65"
-                                2 -> "\u540c\u6b65\u4e2d"
-                                3 -> "\u5931\u8d25"
-                                else -> "\u672a\u77e5"
-                            })
+                            DetailRow("客户", "${record.customerName} (${record.customerNo})")
+                            DetailRow("金额", "¥${String.format("%.2f", record.amount)}")
+                            DetailRow("日期", record.advanceDate)
+                            DetailRow("事由", record.reason ?: "-")
+                            DetailRow("经手人", record.handler ?: "-")
+                            DetailRow(
+                                "同步状态",
+                                when (record.syncStatus) {
+                                    0 -> "未同步"
+                                    1 -> "已同步"
+                                    2 -> "同步中"
+                                    3 -> "失败"
+                                    else -> "未知"
+                                }
+                            )
                         }
                         is com.pingwei.lengkubao.data.db.entity.Deduction -> {
-                            DetailRow("\u5ba2\u6237", "${record.customerName} (${record.customerNo})")
-                            DetailRow("\u91d1\u989d", "\u00a5${String.format("%.2f", record.amount)}")
-                            DetailRow("\u65e5\u671f", record.deductDate)
-                            DetailRow("\u4e8b\u7531", record.reason ?: "-")
-                            DetailRow("\u7ecf\u624b\u4eba", record.handler ?: "-")
-                            DetailRow("\u540c\u6b65\u72b6\u6001", when(record.syncStatus) {
-                                0 -> "\u672a\u540c\u6b65"
-                                1 -> "\u5df2\u540c\u6b65"
-                                2 -> "\u540c\u6b65\u4e2d"
-                                3 -> "\u5931\u8d25"
-                                else -> "\u672a\u77e5"
-                            })
+                            DetailRow("客户", "${record.customerName} (${record.customerNo})")
+                            if (record.quantity > 0) {
+                                DetailRow("数量", record.quantity.toString())
+                                DetailRow("单价", "¥${String.format("%.2f", record.unitPrice)}")
+                            }
+                            DetailRow("金额", "¥${String.format("%.2f", record.amount)}")
+                            DetailRow("日期", record.deductDate)
+                            DetailRow("事由", record.reason ?: "-")
+                            DetailRow("经手人", record.handler ?: "-")
+                            DetailRow(
+                                "同步状态",
+                                when (record.syncStatus) {
+                                    0 -> "未同步"
+                                    1 -> "已同步"
+                                    2 -> "同步中"
+                                    3 -> "失败"
+                                    else -> "未知"
+                                }
+                            )
                         }
                     }
                 }
             },
             confirmButton = {
                 TextButton(onClick = onDismiss) {
-                    Text("\u5173\u95ed")
+                    Text("关闭")
                 }
             }
         )

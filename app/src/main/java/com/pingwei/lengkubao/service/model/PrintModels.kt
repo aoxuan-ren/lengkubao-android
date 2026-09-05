@@ -34,7 +34,7 @@ data class PrintResult(
  * 单据类型
  */
 enum class BillType {
-    SALE, IN_STOCK, PACKAGING
+    SALE, IN_STOCK, PACKAGING, PRESALE
 }
 
 /**

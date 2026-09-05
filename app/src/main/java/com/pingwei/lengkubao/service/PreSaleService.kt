@@ -21,7 +21,7 @@ class PreSaleService(
         saleMode: String,
         remark: String,
         initialPayment: Double = 0.0,
-        payMethod: String = PayMethod.CASH
+        payMethod: String = PayMethod.WECHAT
     ): Result<Pair<Long, String>> = withContext(Dispatchers.IO) {
         try {
             if (items.isEmpty()) return@withContext Result.failure(IllegalStateException("请添加商品"))
@@ -114,45 +114,161 @@ class PreSaleService(
         try {
             val bill = database.preSaleBillDao().getBillById(billId)
                 ?: return@withContext Result.failure(IllegalStateException("单据不存在"))
-            if (bill.status != PreSaleStatus.PRESALE) {
-                return@withContext Result.failure(IllegalStateException("仅预售状态可发货"))
+            if (bill.saleMode != PreSaleMode.PRESALE) {
+                return@withContext Result.failure(IllegalStateException("当前已是已售模式"))
+            }
+            if (bill.status != PreSaleStatus.PRESALE && bill.status != PreSaleStatus.SHIPPED) {
+                return@withContext Result.failure(IllegalStateException("当前状态不可发货出库"))
             }
             val items = database.preSaleItemDao().getItemsByBillId(billId)
-            val confirmResult = stockService.confirmMultipleDeductionsForPreSale(
-                items = items,
-                locationId = bill.locationId,
-                locationName = bill.locationName,
-                billId = billId,
-                billNo = bill.billNo
-            )
-            if (confirmResult.isFailure) {
-                return@withContext confirmResult
+            val remaining = items.mapNotNull { item ->
+                val qty = item.quantity - item.shippedQuantity
+                if (qty > 0) item.productNo to qty else null
+            }.toMap()
+            if (remaining.isEmpty()) {
+                return@withContext Result.failure(IllegalStateException("已全部出库"))
             }
-            database.preSaleBillDao().updateStatus(billId, PreSaleStatus.SHIPPED)
-            Result.success(Unit)
+            recordOutboundInternal(billId, remaining, "").map { Unit }
         } catch (e: Exception) {
             Result.failure(e)
         }
+    }
+
+    suspend fun recordOutbound(
+        billId: Long,
+        productQuantities: Map<String, Int>,
+        remark: String = ""
+    ): Result<Long> = withContext(Dispatchers.IO) {
+        recordOutboundInternal(billId, productQuantities, remark)
+    }
+
+    private suspend fun recordOutboundInternal(
+        billId: Long,
+        productQuantities: Map<String, Int>,
+        remark: String
+    ): Result<Long> {
+        val outboundProducts = productQuantities.filterValues { it > 0 }
+        if (outboundProducts.isEmpty()) {
+            return Result.failure(IllegalStateException("请填写出库数量"))
+        }
+
+        val bill = database.preSaleBillDao().getBillById(billId)
+            ?: return Result.failure(IllegalStateException("单据不存在"))
+        if (bill.saleMode != PreSaleMode.PRESALE) {
+            return Result.failure(IllegalStateException("当前已是已售模式"))
+        }
+        if (bill.status != PreSaleStatus.PRESALE && bill.status != PreSaleStatus.SHIPPED) {
+            return Result.failure(IllegalStateException("当前状态不可发货出库"))
+        }
+
+        val billItems = database.preSaleItemDao().getItemsByBillId(billId)
+        val itemMap = billItems.associateBy { it.itemId }
+        val recordItems = mutableListOf<OutboundRecordItem>()
+
+        for ((productKey, qty) in outboundProducts) {
+            val item = findBillItem(billItems, productKey)
+                ?: return Result.failure(IllegalStateException("商品明细不存在"))
+            val remaining = item.quantity - item.shippedQuantity
+            if (qty > remaining) {
+                return Result.failure(
+                    IllegalStateException("${item.productName} 出库数量不能超过剩余 $remaining${item.unit}")
+                )
+            }
+            recordItems.add(
+                OutboundRecordItem(
+                    billItemId = item.itemId,
+                    productId = item.productId,
+                    productNo = item.productNo,
+                    productName = item.productName,
+                    quantity = qty,
+                    unit = item.unit
+                )
+            )
+        }
+
+        for (recordItem in recordItems) {
+            val item = itemMap[recordItem.billItemId] ?: findBillItem(billItems, recordItem.productNo)!!
+            val deductResult = stockService.confirmSaleDeduction(
+                productId = recordItem.productId,
+                productName = recordItem.productName,
+                locationId = bill.locationId,
+                locationName = bill.locationName,
+                quantity = recordItem.quantity,
+                billId = billId,
+                billNo = bill.billNo,
+                billType = BillType.PRESALE
+            )
+            if (deductResult.isFailure) {
+                return Result.failure(
+                    deductResult.exceptionOrNull() ?: IllegalStateException("${item.productName} 库存扣减失败")
+                )
+            }
+        }
+
+        val recordId = database.outboundRecordDao().insert(
+            OutboundRecord(billId = billId, remark = remark)
+        )
+        database.outboundRecordItemDao().insertAll(
+            recordItems.map { it.copy(outboundRecordId = recordId) }
+        )
+
+        for (recordItem in recordItems) {
+            val item = itemMap[recordItem.billItemId] ?: findBillItem(billItems, recordItem.productNo)!!
+            database.preSaleItemDao().updateShippedQuantity(
+                recordItem.billItemId,
+                item.shippedQuantity + recordItem.quantity
+            )
+        }
+
+        val updatedItems = database.preSaleItemDao().getItemsByBillId(billId)
+        val fullyShipped = updatedItems.all { it.shippedQuantity >= it.quantity }
+        if (fullyShipped) {
+            database.preSaleBillDao().updateSaleModeAndStatus(
+                billId,
+                PreSaleMode.DIRECT_OUT,
+                PreSaleStatus.COMPLETED,
+            )
+        } else {
+            database.preSaleBillDao().updateStatus(billId, PreSaleStatus.SHIPPED)
+        }
+        Log.d(TAG, "预售单分次出库: ${bill.billNo} recordId=$recordId fullyShipped=$fullyShipped")
+        return Result.success(recordId)
+    }
+
+    private fun findBillItem(billItems: List<PreSaleItem>, productKey: String): PreSaleItem? {
+        if (productKey.isBlank()) return null
+        return billItems.find { it.productNo == productKey }
+            ?: billItems.find { it.productName == productKey }
+            ?: productKey.toLongOrNull()?.let { itemId ->
+                billItems.find { it.itemId == itemId }
+            }
     }
 
     suspend fun voidBill(billId: Long): Result<Unit> = withContext(Dispatchers.IO) {
         try {
             val bill = database.preSaleBillDao().getBillById(billId)
                 ?: return@withContext Result.failure(IllegalStateException("单据不存在"))
-            if (bill.status == PreSaleStatus.SHIPPED || bill.status == PreSaleStatus.CANCELLED) {
+            if (bill.status == PreSaleStatus.COMPLETED || bill.status == PreSaleStatus.CANCELLED) {
                 return@withContext Result.failure(IllegalStateException("当前状态不可作废"))
             }
             val items = database.preSaleItemDao().getItemsByBillId(billId)
-            if (bill.status == PreSaleStatus.PRESALE) {
-                stockService.releaseMultipleReservationsForPreSale(
-                    items = items,
-                    locationId = bill.locationId,
-                    locationName = bill.locationName,
-                    billId = billId,
-                    billNo = bill.billNo
-                )
+            if (bill.status == PreSaleStatus.PRESALE || bill.status == PreSaleStatus.SHIPPED) {
+                val remainingItems = items.mapNotNull { item ->
+                    val remaining = item.quantity - item.shippedQuantity
+                    if (remaining > 0) item.copy(quantity = remaining) else null
+                }
+                if (remainingItems.isNotEmpty()) {
+                    stockService.releaseMultipleReservationsForPreSale(
+                        items = remainingItems,
+                        locationId = bill.locationId,
+                        locationName = bill.locationName,
+                        billId = billId,
+                        billNo = bill.billNo
+                    )
+                }
             }
             database.preSaleBillDao().updateStatus(billId, PreSaleStatus.CANCELLED)
+            database.preSaleBillDao().updateSyncStatus(billId, 0)
             Result.success(Unit)
         } catch (e: Exception) {
             Result.failure(e)
@@ -164,7 +280,7 @@ class PreSaleService(
         amount: Double,
         payMethod: String,
         remark: String = ""
-    ): Result<Unit> = withContext(Dispatchers.IO) {
+    ): Result<Long> = withContext(Dispatchers.IO) {
         recordPaymentInternal(billId, amount, payMethod, remark)
     }
 
@@ -173,7 +289,7 @@ class PreSaleService(
         amount: Double,
         payMethod: String,
         remark: String
-    ): Result<Unit> {
+    ): Result<Long> {
         if (amount <= 0) return Result.failure(IllegalStateException("收款金额必须大于0"))
         val bill = database.preSaleBillDao().getBillById(billId)
             ?: return Result.failure(IllegalStateException("单据不存在"))
@@ -184,7 +300,7 @@ class PreSaleService(
         if (newPaid > bill.totalAmount + 0.001) {
             return Result.failure(IllegalStateException("收款总额不能超过应收金额"))
         }
-        database.paymentRecordDao().insert(
+        val paymentId = database.paymentRecordDao().insert(
             PaymentRecord(
                 billId = billId,
                 amount = amount,
@@ -193,6 +309,7 @@ class PreSaleService(
             )
         )
         database.preSaleBillDao().updatePaidAmount(billId, newPaid)
-        return Result.success(Unit)
+        database.preSaleBillDao().updateSyncStatus(billId, 0)
+        return Result.success(paymentId)
     }
 }

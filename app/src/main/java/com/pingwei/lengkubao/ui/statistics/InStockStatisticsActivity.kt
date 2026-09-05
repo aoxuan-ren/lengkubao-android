@@ -26,6 +26,8 @@ import androidx.compose.ui.unit.sp
 import androidx.lifecycle.lifecycleScope
 import com.pingwei.lengkubao.data.db.AppDatabase
 import com.pingwei.lengkubao.data.db.entity.Customer
+import com.pingwei.lengkubao.data.db.entity.CustomerType
+import com.pingwei.lengkubao.data.db.entity.PcInboundDailySnapshot
 import com.pingwei.lengkubao.ui.common.ConfigManager
 import com.pingwei.lengkubao.ui.instock.components.SearchableOptionalCustomerField
 import com.pingwei.lengkubao.ui.theme.LengkubaoTheme
@@ -94,7 +96,7 @@ class InStockStatisticsActivity : ComponentActivity() {
 
         suspend fun loadCustomers(): List<Customer> = withContext(Dispatchers.IO) {
             try {
-                database.customerDao().getAllCustomersSync()
+                database.customerDao().getCustomersByTypeSync(CustomerType.SELLER)
             } catch (e: Exception) {
                 e.printStackTrace()
                 emptyList()
@@ -132,46 +134,12 @@ class InStockStatisticsActivity : ComponentActivity() {
                         )
                     }
 
-                    Log.d("InStockStats", "快照查询结果数量: ${snapshotRows.size}")
+                    Log.d("InStockStats", "PC入库快照: ${snapshotRows.size} 条")
 
-                    val grouped = when (viewMode) {
-                        1 -> snapshotRows.groupBy { it.spec } // 按商品分组
-                        else -> snapshotRows.groupBy { "${it.locationName}||${it.spec}" } // 按库位+商品分组
+                    aggregateFromSnapshotRows(snapshotRows, viewMode).let { (items, totals) ->
+                        statsList = items
+                        totalStats = totals
                     }
-
-                    val aggregatedItems = grouped.values.map { rows ->
-                        val first = rows.first()
-                        val locationName = if (viewMode == 1) "" else first.locationName
-                        InboundStatItem(
-                            locationId = 0L,
-                            locationNo = "",
-                            locationName = locationName,
-                            productId = 0L,
-                            productNo = "",
-                            productName = first.spec,
-                            quantity = rows.sumOf { it.quantity },
-                            orderCount = rows.sumOf { it.orderCount },
-                            totalAmount = rows.sumOf { it.amount }
-                        )
-                    }.sortedWith(
-                        compareByDescending<InboundStatItem> { it.quantity }
-                            .thenBy { it.locationName }
-                            .thenBy { it.productName }
-                    )
-
-                    statsList = aggregatedItems
-
-                    val totalQuantity = snapshotRows.sumOf { it.quantity }
-                    val totalAmount = snapshotRows.sumOf { it.amount }
-                    val productCount = snapshotRows.map { it.spec }.distinct().size
-                    val totalOrderCount = snapshotRows.sumOf { it.orderCount }
-
-                    totalStats = InboundTotalStats(
-                        totalQuantity = totalQuantity,
-                        totalAmount = totalAmount,
-                        productCount = productCount,
-                        orderCount = totalOrderCount
-                    )
 
                 } catch (e: Exception) {
                     e.printStackTrace()
@@ -545,7 +513,7 @@ class InStockStatisticsActivity : ComponentActivity() {
                             contentAlignment = Alignment.Center
                         ) {
                             Text(
-                                text = "暂无明细数据",
+                                text = "暂无数据，请先与 PC 同步",
                                 color = Color.Gray,
                                 fontSize = 13.sp
                             )
@@ -605,6 +573,40 @@ class InStockStatisticsActivity : ComponentActivity() {
         }
     }
 
+    private fun aggregateFromSnapshotRows(
+        snapshotRows: List<PcInboundDailySnapshot>,
+        viewMode: Int
+    ): Pair<List<InboundStatItem>, InboundTotalStats> {
+        val grouped = when (viewMode) {
+            1 -> snapshotRows.groupBy { it.spec }
+            else -> snapshotRows.groupBy { "${it.locationName}||${it.spec}" }
+        }
+        val items = grouped.values.map { rows ->
+            val first = rows.first()
+            InboundStatItem(
+                locationId = 0L,
+                locationName = if (viewMode == 1) "" else first.locationName,
+                productId = 0L,
+                productNo = "",
+                productName = first.spec,
+                quantity = rows.sumOf { it.quantity },
+                orderCount = rows.sumOf { it.orderCount },
+                totalAmount = rows.sumOf { it.amount }
+            )
+        }.sortedWith(
+            compareByDescending<InboundStatItem> { it.quantity }
+                .thenBy { it.locationName }
+                .thenBy { it.productName }
+        )
+        val totals = InboundTotalStats(
+            totalQuantity = snapshotRows.sumOf { it.quantity },
+            totalAmount = snapshotRows.sumOf { it.amount },
+            productCount = snapshotRows.map { it.spec }.distinct().size,
+            orderCount = snapshotRows.sumOf { it.orderCount }
+        )
+        return items to totals
+    }
+
     private fun formatDate(timestamp: Long): String {
         return dateFormat.format(Date(timestamp))
     }
@@ -624,7 +626,6 @@ class InStockStatisticsActivity : ComponentActivity() {
  */
 data class InboundStatItem(
     val locationId: Long,
-    val locationNo: String,
     val locationName: String,
     val productId: Long,
     val productNo: String,

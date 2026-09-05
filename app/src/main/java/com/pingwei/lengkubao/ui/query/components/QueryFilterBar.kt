@@ -1,6 +1,7 @@
 package com.pingwei.lengkubao.ui.query.components
 
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Search
@@ -8,11 +9,14 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.pingwei.lengkubao.ui.theme.AppDimens
+import com.pingwei.lengkubao.ui.common.rememberDismissKeyboard
 import com.pingwei.lengkubao.utils.BillQuerySearchFilter
 
 /**
@@ -29,6 +33,9 @@ fun QueryFilterBar(
     onFilterChipClick: (String) -> Unit,
     modifier: Modifier = Modifier
 ) {
+    val dismissKeyboard = rememberDismissKeyboard()
+    val searchFocusRequester = remember { FocusRequester() }
+
     Card(
         modifier = modifier.fillMaxWidth(),
         elevation = CardDefaults.cardElevation(defaultElevation = 4.dp)
@@ -48,7 +55,8 @@ fun QueryFilterBar(
                     onValueChange = onSearchTextChange,
                     modifier = Modifier
                         .weight(1f)
-                        .height(AppDimens.searchFieldHeight),
+                        .height(AppDimens.searchFieldHeight)
+                        .focusRequester(searchFocusRequester),
                     placeholder = {
                         Text(
                             text = BillQuerySearchFilter.PLACEHOLDER,
@@ -62,7 +70,10 @@ fun QueryFilterBar(
                     // 补充 imeAction = ImeAction.Search 优化体验（可选，不影响原有功能）
                     keyboardOptions = KeyboardOptions(
                         keyboardType = KeyboardType.Text,
-                        imeAction = ImeAction.Search // 软键盘显示「搜索」按钮，贴合业务场景，可删除
+                        imeAction = ImeAction.Search
+                    ),
+                    keyboardActions = KeyboardActions(
+                        onSearch = { onSearch() }
                     ),
                     singleLine = true,
                     leadingIcon = {
@@ -72,7 +83,10 @@ fun QueryFilterBar(
                 )
 
                 Button(
-                    onClick = onSearch,
+                    onClick = {
+                        onSearch()
+                        searchFocusRequester.requestFocus()
+                    },
                     modifier = Modifier.height(AppDimens.searchFieldHeight)
                 ) {
                     Text("搜索")
@@ -89,8 +103,7 @@ fun QueryFilterBar(
                     FilterChip(
                         selected = timeRangeLabel == label,
                         onClick = {
-                            // 调用父组件传递的回调函数
-                            // 注意：这里需要父组件传递一个回调来处理点击
+                            dismissKeyboard()
                             onFilterChipClick(label)
                         },
                         label = { Text(label) },
@@ -99,7 +112,10 @@ fun QueryFilterBar(
                 }
 
                 OutlinedButton(
-                    onClick = onTimeRangeClick,
+                    onClick = {
+                        dismissKeyboard()
+                        onTimeRangeClick()
+                    },
                     modifier = Modifier.weight(1.5f)
                 ) {
                     Text(timeRangeLabel)

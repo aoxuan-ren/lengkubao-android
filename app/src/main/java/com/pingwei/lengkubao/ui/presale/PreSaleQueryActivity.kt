@@ -1,6 +1,7 @@
 package com.pingwei.lengkubao.ui.presale
 
 import android.app.Activity
+import android.content.BroadcastReceiver
 import android.content.Intent
 import android.os.Bundle
 import androidx.activity.ComponentActivity
@@ -24,19 +25,29 @@ import com.pingwei.lengkubao.data.db.entity.PreSaleMode
 import com.pingwei.lengkubao.data.db.entity.PreSaleStatus
 import com.pingwei.lengkubao.ui.presale.viewmodel.PreSaleQueryViewModel
 import com.pingwei.lengkubao.ui.query.QueryTimeRangeUtils
+import com.pingwei.lengkubao.ui.common.rememberDismissKeyboard
 import com.pingwei.lengkubao.ui.theme.AppDimens
 import com.pingwei.lengkubao.ui.theme.LengkubaoTheme
 import java.text.SimpleDateFormat
 import java.util.*
 
 class PreSaleQueryActivity : ComponentActivity() {
+    private var yearChangeReceiver: BroadcastReceiver? = null
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        yearChangeReceiver = registerFinishOnFiscalYearChanged()
         setContent {
             LengkubaoTheme {
                 PreSaleQueryScreen(onBack = { finish() })
             }
         }
+    }
+
+    override fun onDestroy() {
+        unregisterFinishOnFiscalYearChanged(yearChangeReceiver)
+        yearChangeReceiver = null
+        super.onDestroy()
     }
 }
 
@@ -51,6 +62,7 @@ fun PreSaleQueryScreen(
     val isLoading by viewModel.isLoading.collectAsState()
     var searchText by remember { mutableStateOf("") }
     var timeRangeLabel by remember { mutableStateOf("7天") }
+    val dismissKeyboard = rememberDismissKeyboard()
 
     val detailLauncher = androidx.activity.compose.rememberLauncherForActivityResult(
         ActivityResultContracts.StartActivityForResult()
@@ -85,7 +97,7 @@ fun PreSaleQueryScreen(
             Modifier.fillMaxSize().padding(padding).padding(AppDimens.pagePadding)
         ) {
             Text(
-                "预售单/收款数据尚未同步电脑端",
+                "连接电脑后将自动同步预售单；列表显示本地同步状态",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.secondary
             )
@@ -96,14 +108,16 @@ fun PreSaleQueryScreen(
                     searchText = it
                     viewModel.refreshData(it, timeRangeLabel)
                 },
-                label = { Text("单号/买家") },
-                modifier = Modifier.fillMaxWidth()
+                label = { Text("输入单据号/买家名称/首字母") },
+                modifier = Modifier.fillMaxWidth(),
+                singleLine = true
             )
             Row(Modifier.padding(vertical = 8.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 QueryTimeRangeUtils.PRESET_LABELS.forEach { label ->
                     FilterChip(
                         selected = timeRangeLabel == label,
                         onClick = {
+                            dismissKeyboard()
                             timeRangeLabel = label
                             viewModel.refreshData(searchText, label)
                         },
@@ -117,6 +131,7 @@ fun PreSaleQueryScreen(
             LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 items(bills, key = { it.id }) { bill ->
                     PreSaleBillListItem(bill) {
+                        dismissKeyboard()
                         detailLauncher.launch(
                             Intent(context, PreSaleDetailActivity::class.java).apply {
                                 putExtra(PreSaleDetailActivity.EXTRA_BILL_ID, bill.id)
@@ -137,10 +152,21 @@ private fun PreSaleBillListItem(bill: PreSaleBill, onClick: () -> Unit) {
         Column(Modifier.padding(12.dp)) {
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                 Text(bill.billNo, fontWeight = FontWeight.Bold)
-                Text(statusLabel(bill.status))
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(
+                        if (bill.syncStatus == 1) "已同步" else "待同步",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = if (bill.syncStatus == 1) {
+                            MaterialTheme.colorScheme.primary
+                        } else {
+                            MaterialTheme.colorScheme.error
+                        }
+                    )
+                    Text(statusLabel(bill.status))
+                }
             }
             Text("买家: ${bill.buyerName}")
-            Text("模式: ${if (bill.saleMode == PreSaleMode.PRESALE) "预售" else "出库销售"}")
+            Text("模式: ${if (bill.saleMode == PreSaleMode.PRESALE) "预售" else "已售"}")
             Text("总额 ¥${"%.2f".format(bill.totalAmount)} | 已收 ¥${"%.2f".format(bill.paidAmount)} | 欠款 ¥${"%.2f".format(unpaid)}")
             Text(dateFmt.format(Date(bill.createTime)), style = MaterialTheme.typography.bodySmall)
         }
@@ -150,7 +176,7 @@ private fun PreSaleBillListItem(bill: PreSaleBill, onClick: () -> Unit) {
 private fun statusLabel(status: String): String = when (status) {
     PreSaleStatus.PRESALE -> "预售中"
     PreSaleStatus.COMPLETED -> "已出库"
-    PreSaleStatus.SHIPPED -> "已发货"
+    PreSaleStatus.SHIPPED -> "部分出库"
     PreSaleStatus.CANCELLED -> "已作废"
     else -> status
 }

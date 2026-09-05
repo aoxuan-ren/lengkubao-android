@@ -42,12 +42,14 @@ class ConfigManager(context: Context) {
         private const val KEY_QUERY_INSTOCK_TIME_RANGE = "query_instock_time_range"
         private const val KEY_QUERY_SALEOUT_TIME_RANGE = "query_saleout_time_range"
         private const val KEY_QUERY_PACKAGING_TIME_RANGE = "query_packaging_time_range"
+        private const val KEY_QUERY_ADVANCE_DEDUCTION_TIME_RANGE = "query_advance_deduction_time_range"
     }
 
     enum class QueryTimeRangeType {
         IN_STOCK,
         SALE_OUT,
-        PACKAGING
+        PACKAGING,
+        ADVANCE_DEDUCTION
     }
 
     // ==================== 原有核心功能（KTX 优化） ====================
@@ -97,6 +99,7 @@ class ConfigManager(context: Context) {
             QueryTimeRangeType.IN_STOCK -> KEY_QUERY_INSTOCK_TIME_RANGE
             QueryTimeRangeType.SALE_OUT -> KEY_QUERY_SALEOUT_TIME_RANGE
             QueryTimeRangeType.PACKAGING -> KEY_QUERY_PACKAGING_TIME_RANGE
+            QueryTimeRangeType.ADVANCE_DEDUCTION -> KEY_QUERY_ADVANCE_DEDUCTION_TIME_RANGE
         }
         return prefs.getString(key, defaultLabel) ?: defaultLabel
     }
@@ -106,6 +109,7 @@ class ConfigManager(context: Context) {
             QueryTimeRangeType.IN_STOCK -> KEY_QUERY_INSTOCK_TIME_RANGE
             QueryTimeRangeType.SALE_OUT -> KEY_QUERY_SALEOUT_TIME_RANGE
             QueryTimeRangeType.PACKAGING -> KEY_QUERY_PACKAGING_TIME_RANGE
+            QueryTimeRangeType.ADVANCE_DEDUCTION -> KEY_QUERY_ADVANCE_DEDUCTION_TIME_RANGE
         }
         prefs.edit { putString(key, label) }
     }

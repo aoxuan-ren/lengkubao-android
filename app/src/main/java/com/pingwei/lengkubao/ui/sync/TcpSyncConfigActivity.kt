@@ -4,7 +4,9 @@ import android.annotation.SuppressLint
 import android.content.Context
 import android.content.Intent
 import android.os.Bundle
+import android.widget.Toast
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
@@ -29,13 +31,18 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.journeyapps.barcodescanner.ScanContract
 import com.pingwei.lengkubao.LengKuBaoApplication
 import com.pingwei.lengkubao.service.TcpSyncService
+import com.pingwei.lengkubao.sync.QrPairingHelper
 import com.pingwei.lengkubao.sync.SyncState
 import com.pingwei.lengkubao.sync.TcpSyncManager
+import com.pingwei.lengkubao.sync.rememberTcpConnectionState
+import com.pingwei.lengkubao.sync.rememberTcpSyncState
 import com.pingwei.lengkubao.sync.mdns.MdnsDeviceDiscovery
 import com.pingwei.lengkubao.ui.theme.LengkubaoTheme
 import com.pingwei.lengkubao.utils.Constant
+import com.pingwei.lengkubao.utils.ScannerUtils
 import com.pingwei.lengkubao.utils.SyncStatusUtils
 import kotlinx.coroutines.delay
 
@@ -66,26 +73,49 @@ sealed class DiscoveredDeviceItem {
 }
 @SuppressLint("RememberReturnType", "UnrememberedMutableState")
 @Composable
-fun TcpSyncConfigScreen(onBackClick: () -> Unit) {
+fun TcpSyncConfigScreen(
+    onBackClick: () -> Unit,
+) {
     val context = LocalContext.current
-    val application = remember { LengKuBaoApplication.getInstance() }
-    val syncManager: TcpSyncManager = remember { LengKuBaoApplication.getSyncManager() }
     val scope = rememberCoroutineScope()
     val activityScope = (context as? ComponentActivity)?.lifecycleScope
     val scrollState = rememberScrollState()
 
-    // 监听TCP连接状态（这是最重要的！）
-    val connectionState: TcpSyncManager.ConnectionState by syncManager.connectionState.collectAsStateWithLifecycle()
-    val syncState: SyncState by syncManager.syncState.collectAsStateWithLifecycle()
+    val connectionState = rememberTcpConnectionState()
+    val syncState = rememberTcpSyncState()
 
     val prefs = remember { context.getSharedPreferences("sync_config", Context.MODE_PRIVATE) }
 
-    var serverIp: String by remember { mutableStateOf(syncManager.getCurrentConfig().serverIp) }
-    var serverPort: String by remember { mutableStateOf(syncManager.getCurrentConfig().serverPort.toString()) }
-    var autoSync: Boolean by remember { mutableStateOf(prefs.getBoolean("auto_sync", false)) }
+    var serverIp: String by remember {
+        mutableStateOf(LengKuBaoApplication.getSyncManager().getCurrentConfig().serverIp)
+    }
+    var serverPort: String by remember {
+        mutableStateOf(LengKuBaoApplication.getSyncManager().getCurrentConfig().serverPort.toString())
+    }
+    var autoSync: Boolean by remember { mutableStateOf(prefs.getBoolean(Constant.PREF_AUTO_SYNC, Constant.PREF_AUTO_SYNC_DEFAULT)) }
 
     // 配对码相关状态
     var pairingCode by remember { mutableStateOf(prefs.getString(Constant.PREF_PAIRING_CODE, "") ?: "") }
+
+    val scanLauncher = rememberLauncherForActivityResult(ScanContract()) { result ->
+        val raw = result.contents
+        if (raw.isNullOrBlank()) return@rememberLauncherForActivityResult
+        val payload = QrPairingHelper.parse(raw)
+        if (payload == null) {
+            Toast.makeText(context, "无法识别配对二维码，请扫描电脑端显示的二维码", Toast.LENGTH_LONG).show()
+            return@rememberLauncherForActivityResult
+        }
+        try {
+            LengKuBaoApplication.getSyncManager().applyQrPairing(payload)
+            pairingCode = payload.code
+            serverIp = payload.ip
+            serverPort = payload.port.toString()
+            val label = if (payload.name.isNotBlank()) payload.name else payload.ip
+            Toast.makeText(context, "已配对 $label，正在连接…", Toast.LENGTH_SHORT).show()
+        } catch (e: Exception) {
+            Toast.makeText(context, e.message ?: "配对失败", Toast.LENGTH_LONG).show()
+        }
+    }
     var autoConnect by remember { mutableStateOf(prefs.getBoolean(Constant.PREF_AUTO_CONNECT, true)) }
     var showResetDialog by remember { mutableStateOf(false) }
     var isResettingSyncStatus by remember { mutableStateOf(false) }
@@ -107,18 +137,21 @@ fun TcpSyncConfigScreen(onBackClick: () -> Unit) {
     val isUdpScanning by udpDiscovery.isScanning.collectAsStateWithLifecycle()
     val udpMessage by udpDiscovery.messageFlow.collectAsStateWithLifecycle()
 
-    // 发现方式
+    var showAdvancedSettings by remember {
+        mutableStateOf(prefs.getBoolean(Constant.PREF_SHOW_ADVANCED_SYNC, false))
+    }
+
     var discoveryMethod by remember {
         mutableStateOf(prefs.getString(Constant.PREF_DISCOVERY_METHOD, "both") ?: "both")
     }
 
     // ========== 新增：页面加载时自动扫描 ==========
     // 修改这个 LaunchedEffect
-    LaunchedEffect(Unit) {
+    LaunchedEffect(isTcpConnected, pairingCode, showAdvancedSettings) {
+        if (!showAdvancedSettings || isTcpConnected || pairingCode.isBlank()) return@LaunchedEffect
         delay(500)
 
-        // 只要未连接，就持续扫描
-        while (!isTcpConnected && pairingCode.isNotBlank()) {
+        while (!isTcpConnected && pairingCode.isNotBlank() && showAdvancedSettings) {
             scanResult = "🔄 持续扫描中..."
 
             when (discoveryMethod) {
@@ -166,8 +199,8 @@ fun TcpSyncConfigScreen(onBackClick: () -> Unit) {
     // 连接状态文本和颜色
     val (connectionStatus, statusColor) = remember(connectionState) {
         when (connectionState) {
-            TcpSyncManager.ConnectionState.CONNECTED -> Pair("✅ TCP已连接（配对码匹配）", Color.Green)
-            TcpSyncManager.ConnectionState.CONNECTING -> Pair("🔄 TCP连接中...", Color.Yellow)
+            TcpSyncManager.ConnectionState.CONNECTED -> Pair("✅ 已连接（配对成功）", Color.Green)
+            TcpSyncManager.ConnectionState.CONNECTING -> Pair("🔄 正在连接/注册…", Color.Yellow)
             TcpSyncManager.ConnectionState.ERROR -> Pair("❌ TCP连接错误", Color.Red)
             TcpSyncManager.ConnectionState.SYNCING -> Pair("📤 同步中...", Color.Blue)
             TcpSyncManager.ConnectionState.DISCONNECTED -> Pair("📴 TCP未连接", Color.Gray)
@@ -222,13 +255,13 @@ fun TcpSyncConfigScreen(onBackClick: () -> Unit) {
                     }.apply()
 
                     // 自动连接TCP
-                    syncManager.updateConfig(
+                    LengKuBaoApplication.getSyncManager().updateConfig(
                         TcpSyncManager.SyncConfig(
                             serverIp = serverIp,
                             serverPort = serverPort.toIntOrNull() ?: 8080
                         )
                     )
-                    syncManager.connect()
+                    LengKuBaoApplication.getSyncManager().connect()
 
                     scanResult = "✅ 已自动连接到: ${device.deviceName}"
                 }
@@ -289,7 +322,7 @@ fun TcpSyncConfigScreen(onBackClick: () -> Unit) {
 
                 if (isTcpConnected) {
                     Text(
-                        text = "服务器: ${syncManager.getCurrentConfig().serverIp}:${syncManager.getCurrentConfig().serverPort}",
+                        text = "服务器: ${LengKuBaoApplication.getSyncManager().getCurrentConfig().serverIp}:${LengKuBaoApplication.getSyncManager().getCurrentConfig().serverPort}",
                         style = MaterialTheme.typography.bodyMedium
                     )
                     Text(
@@ -305,6 +338,47 @@ fun TcpSyncConfigScreen(onBackClick: () -> Unit) {
             }
         }
 
+        // 扫码配对（主路径）
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            colors = CardDefaults.cardColors(containerColor = Color(0xFFE3F2FD))
+        ) {
+            Column(
+                modifier = Modifier.padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                Text(
+                    text = "📷 扫码连接电脑",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Bold
+                )
+                Text(
+                    text = "在电脑端顶部查看配对二维码，手持扫一次即可完成配对",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = Color.Gray
+                )
+                Button(
+                    onClick = {
+                        val options = ScannerUtils.getQrScanOptions()
+                            .setPrompt("请扫描电脑屏幕上的配对二维码")
+                        scanLauncher.launch(options)
+                    },
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text("扫描配对二维码")
+                }
+                TextButton(
+                    onClick = {
+                        showAdvancedSettings = !showAdvancedSettings
+                        prefs.edit().putBoolean(Constant.PREF_SHOW_ADVANCED_SYNC, showAdvancedSettings).apply()
+                    }
+                ) {
+                    Text(if (showAdvancedSettings) "收起高级设置" else "高级设置（手动 IP / 发现方式）")
+                }
+            }
+        }
+
+        if (showAdvancedSettings) {
         // 服务器设置卡片
         Card(modifier = Modifier.fillMaxWidth()) {
             Column(
@@ -341,13 +415,28 @@ fun TcpSyncConfigScreen(onBackClick: () -> Unit) {
                 ) {
                     Button(
                         onClick = {
+                            val trimmedIp = serverIp.trim()
+                            if (!TcpSyncManager.isValidServerIp(trimmedIp)) {
+                                Toast.makeText(context, "请输入有效的 IPv4 地址（如 192.168.1.100）", Toast.LENGTH_SHORT).show()
+                                return@Button
+                            }
                             val port = serverPort.toIntOrNull() ?: 8080
-                            syncManager.updateConfig(
+                            if (port !in 1..65535) {
+                                Toast.makeText(context, "端口号需在 1-65535 之间", Toast.LENGTH_SHORT).show()
+                                return@Button
+                            }
+                            serverIp = trimmedIp
+                            LengKuBaoApplication.getSyncManager().updateConfig(
                                 TcpSyncManager.SyncConfig(
-                                    serverIp = serverIp,
+                                    serverIp = trimmedIp,
                                     serverPort = port
                                 )
                             )
+                            prefs.edit().apply {
+                                putString(Constant.PREF_PAIRED_SERVER_IP, trimmedIp)
+                                putInt(Constant.PREF_PAIRED_SERVER_PORT, port)
+                            }.apply()
+                            Toast.makeText(context, "配置已保存", Toast.LENGTH_SHORT).show()
                         },
                         modifier = Modifier.weight(1f),
                         enabled = !isTcpConnected
@@ -359,9 +448,9 @@ fun TcpSyncConfigScreen(onBackClick: () -> Unit) {
                         onClick = {
                             scope.launch {
                                 if (isTcpConnected) {
-                                    syncManager.disconnect()
+                                    LengKuBaoApplication.getSyncManager().disconnect()
                                 } else {
-                                    syncManager.connect()
+                                    LengKuBaoApplication.getSyncManager().connect()
                                 }
                             }
                         },
@@ -384,7 +473,7 @@ fun TcpSyncConfigScreen(onBackClick: () -> Unit) {
                         checked = autoSync,
                         onCheckedChange = { checked ->
                             autoSync = checked
-                            prefs.edit().putBoolean("auto_sync", checked).apply()
+                            prefs.edit().putBoolean(Constant.PREF_AUTO_SYNC, checked).apply()
                             if (checked) {
                                 TcpSyncService.startService(context)
                             } else {
@@ -614,13 +703,13 @@ fun TcpSyncConfigScreen(onBackClick: () -> Unit) {
                                         }.apply()
 
                                         // 连接TCP
-                                        syncManager.updateConfig(
+                                        LengKuBaoApplication.getSyncManager().updateConfig(
                                             TcpSyncManager.SyncConfig(
                                                 serverIp = serverIp,
                                                 serverPort = serverPort.toIntOrNull() ?: 8080
                                             )
                                         )
-                                        syncManager.connect()
+                                        LengKuBaoApplication.getSyncManager().connect()
                                     }
                                 )
                             }
@@ -716,6 +805,7 @@ fun TcpSyncConfigScreen(onBackClick: () -> Unit) {
                 )
             }
         }
+        } // showAdvancedSettings
 
         if (showResetDialog) {
             AlertDialog(
@@ -769,9 +859,9 @@ fun TcpSyncConfigScreen(onBackClick: () -> Unit) {
                                     endTime = range.endTime
                                 )
                                 if (result.totalCount > 0) {
-                                    syncManager.clearConfirmedItems()
+                                    LengKuBaoApplication.getSyncManager().clearConfirmedItems()
                                 }
-                                resetResultText = "✅ 已重置：入库${result.inStockCount}，销售${result.saleCount}，包装${result.packagingCount}，预支${result.advanceCount}，扣款${result.deductionCount}，合计${result.totalCount}"
+                                resetResultText = "✅ 已重置：入库${result.inStockCount}，销售${result.saleCount}，包装${result.packagingCount}，预支${result.advanceCount}，扣款${result.deductionCount}，预售${result.presaleCount}，预售收款${result.presalePaymentCount}，流水${result.ledgerCount}，合计${result.totalCount}"
                                 isResettingSyncStatus = false
                             }
                         }
@@ -905,6 +995,7 @@ private fun buildResetTimeRange(startDate: String, endDate: String): ResetTimeRa
 }
 
 class TcpSyncConfigActivity : ComponentActivity() {
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContent {
@@ -913,9 +1004,9 @@ class TcpSyncConfigActivity : ComponentActivity() {
                     modifier = Modifier.fillMaxSize(),
                     color = MaterialTheme.colorScheme.background
                 ) {
-                    TcpSyncConfigScreen {
-                        finish()
-                    }
+                    TcpSyncConfigScreen(
+                        onBackClick = { finish() }
+                    )
                 }
             }
         }

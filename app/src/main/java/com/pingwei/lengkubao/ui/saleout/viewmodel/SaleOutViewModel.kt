@@ -9,7 +9,8 @@ import com.pingwei.lengkubao.LengKuBaoApplication // 【新增】导入Applicati
 import com.pingwei.lengkubao.data.db.AppDatabase
 import com.pingwei.lengkubao.data.db.entity.*
 import com.pingwei.lengkubao.data.model.ProductWithStock
-import com.pingwei.lengkubao.service.StockService
+import com.pingwei.lengkubao.service.CustomerInboundStockBackfill
+import com.pingwei.lengkubao.service.CustomerInboundStockService
 import com.pingwei.lengkubao.sync.TcpSyncManager // 【新增】导入TCP同步管理器
 import com.pingwei.lengkubao.ui.common.ConfigManager
 import com.pingwei.lengkubao.utils.PrintUtils.generateBillNo
@@ -25,10 +26,10 @@ class SaleOutViewModel(application: Application) : AndroidViewModel(application)
 
     private val context = application.applicationContext
     private val database by lazy { AppDatabase.getInstance(context) }
-    private val stockService by lazy {
-        StockService(
-            database.stockDao(),
-            database.stockChangeDao()
+    private val customerInboundStockService by lazy {
+        CustomerInboundStockService(
+            database.customerInboundStockDao(),
+            CustomerInboundStockBackfill(database)
         )
     }
 
@@ -92,7 +93,7 @@ class SaleOutViewModel(application: Application) : AndroidViewModel(application)
     }
 
     // === 数据流 ===
-    val allCustomers = database.customerDao().getAllCustomers()
+    val allCustomers = database.customerDao().getCustomersByType(CustomerType.SELLER)
     val allLocations = database.locationDao().getAllLocations()
     val allOperators = database.operatorDao().getAllOperators()
 
@@ -123,6 +124,7 @@ class SaleOutViewModel(application: Application) : AndroidViewModel(application)
     // === 选择操作 ===
     fun selectCustomer(customer: Customer?) {
         _selectedCustomer.value = customer
+        _selectedLocation.value?.let { loadProductsWithStock(it.id) }
     }
 
     fun selectLocation(location: Location?) {
@@ -144,46 +146,41 @@ class SaleOutViewModel(application: Application) : AndroidViewModel(application)
         viewModelScope.launch {
             _isLoading.value = true
             try {
-                // 获取该库位下有库存的商品
-                val stocksWithProduct = database.stockDao()
-                    .getStocksWithProductByLocation(locationId)
+                val customer = _selectedCustomer.value
+                if (customer == null) {
+                    _productsWithStock.value = emptyList()
+                    _productStocks.value = emptyMap()
+                    return@launch
+                }
 
-                // 获取所有启用商品
+                customerInboundStockService.ensureInitialized()
+
                 val allEnabledProducts = database.productDao().getAll()
                     .filter { it.enabled }
 
-                // 构建商品带库存列表
-                val productWithStockList = allEnabledProducts.mapNotNull { product ->
-                    val stockInfo = stocksWithProduct.find { it.productId == product.id }
-                    if (stockInfo != null) {
-                        ProductWithStock(
-                            product = product,
-                            availableStock = stockInfo.availableQuantity,
-                            locationId = locationId,
-                            locationName = _selectedLocation.value?.locationName
-                        )
-                    } else {
-                        // 无库存的商品也可以显示，但库存为0
-                        ProductWithStock(
-                            product = product,
-                            availableStock = 0,
-                            locationId = locationId,
-                            locationName = _selectedLocation.value?.locationName
-                        )
-                    }
+                val productWithStockList = allEnabledProducts.map { product ->
+                    val available = customerInboundStockService.getAvailable(
+                        customerNo = customer.customerNo,
+                        locationId = locationId,
+                        productId = product.id
+                    )
+                    ProductWithStock(
+                        product = product,
+                        availableStock = available,
+                        locationId = locationId,
+                        locationName = _selectedLocation.value?.locationName
+                    )
                 }.sortedBy { it.product.productNo }
 
                 _productsWithStock.value = productWithStockList
-                Log.d(TAG, "✅ 加载带库存商品: ${_productsWithStock.value.size} 个")
+                Log.d(TAG, "✅ 加载可报账库存商品: ${_productsWithStock.value.size} 个")
 
-                // 同时更新旧的productStocks映射（兼容旧代码）
-                val stockMap = stocksWithProduct.associate {
-                    it.productId to it.availableQuantity
+                _productStocks.value = productWithStockList.associate {
+                    it.product.id to it.availableStock
                 }
-                _productStocks.value = stockMap
 
             } catch (e: Exception) {
-                Log.e(TAG, "❌ 加载带库存商品失败: ${e.message}", e)
+                Log.e(TAG, "❌ 加载可报账库存失败: ${e.message}", e)
                 _productsWithStock.value = emptyList()
                 _productStocks.value = emptyMap()
             } finally {
@@ -192,10 +189,10 @@ class SaleOutViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
-    // === 获取指定商品的实时库存 ===
     suspend fun getRealTimeStock(productId: Long): Int {
+        val customer = _selectedCustomer.value ?: return 0
         val locationId = _selectedLocation.value?.id ?: return 0
-        return stockService.getAvailableStock(productId, locationId)
+        return customerInboundStockService.getAvailable(customer.customerNo, locationId, productId)
     }
 
     // === 添加销售商品 ===
@@ -218,8 +215,8 @@ class SaleOutViewModel(application: Application) : AndroidViewModel(application)
             Log.d(TAG, "📊 可用库存: $availableStock, 需求数量: $quantity")
 
             if (availableStock < quantity) {
-                Log.e(TAG, "❌ 错误: 库存不足 (可用: $availableStock, 需求: $quantity)")
-                return kotlin.Result.failure(IllegalStateException("库存不足，可用库存: $availableStock"))
+                Log.e(TAG, "❌ 错误: 可报账库存不足 (可用: $availableStock, 需求: $quantity)")
+                return kotlin.Result.failure(IllegalStateException("可报账库存不足，可用: $availableStock"))
             }
 
             // 【已移除】销售单价必须大于0的校验
@@ -291,7 +288,7 @@ class SaleOutViewModel(application: Application) : AndroidViewModel(application)
             // 2. 检查库存
             val availableStock = getRealTimeStock(product.id)
             if (availableStock < quantity) {
-                return kotlin.Result.failure(IllegalStateException("库存不足，可用库存: $availableStock"))
+                return kotlin.Result.failure(IllegalStateException("可报账库存不足，可用: $availableStock"))
             }
 
             // 【已移除】销售单价必须大于0的校验
@@ -375,18 +372,16 @@ class SaleOutViewModel(application: Application) : AndroidViewModel(application)
             // 3. 生成单据号
             val billNo = generateBillNo("XS")
 
-            // 4. 预留库存
-            Log.d(TAG, "🔒 开始预留库存...")
-            val reserveResult = stockService.reserveMultipleForSale(
+            // 4. 预留可报账库存
+            Log.d(TAG, "🔒 开始预留可报账库存...")
+            val reserveResult = customerInboundStockService.reserveMultipleForSale(
+                customerNo = customer.customerNo,
                 items = items,
-                locationId = location.id,
-                locationName = location.locationName,
-                billId = 0,
-                billNo = billNo
+                locationId = location.id
             )
 
             if (reserveResult.isFailure) {
-                val errorMsg = reserveResult.exceptionOrNull()?.message ?: "库存预留失败"
+                val errorMsg = reserveResult.exceptionOrNull()?.message ?: "可报账库存预留失败"
                 _saveResult.value = SaveResult.Error(errorMsg)
                 return kotlin.Result.failure(IllegalStateException(errorMsg))
             }
@@ -414,7 +409,7 @@ class SaleOutViewModel(application: Application) : AndroidViewModel(application)
             // 6. 保存单据
             val billId = database.saleBillDao().insert(bill)
             if (billId <= 0) {
-                releaseReservedStocks(items, location)
+                releaseReservedStocks(items, customer, location)
                 _saveResult.value = SaveResult.Error("销售单保存失败")
                 return kotlin.Result.failure(IllegalStateException("销售单保存失败"))
             }
@@ -423,14 +418,12 @@ class SaleOutViewModel(application: Application) : AndroidViewModel(application)
             val itemsWithBillId = items.map { it.copy(billId = billId) }
             database.saleItemDao().insertAll(itemsWithBillId)
 
-            // 8. 确认库存扣减
-            Log.d(TAG, "💰 开始确认库存扣减...")
-            val confirmResult = stockService.confirmMultipleDeductions(
+            // 8. 确认可报账扣减（释放预留，已售量由 sale_item 统计）
+            Log.d(TAG, "💰 开始确认可报账扣减...")
+            val confirmResult = customerInboundStockService.confirmMultipleDeductions(
+                customerNo = customer.customerNo,
                 items = items,
-                locationId = location.id,
-                locationName = location.locationName,
-                billId = billId,
-                billNo = billNo
+                locationId = location.id
             )
 
             if (confirmResult.isFailure) {
@@ -515,21 +508,14 @@ class SaleOutViewModel(application: Application) : AndroidViewModel(application)
     // === 释放已预留的库存 ===
     private suspend fun releaseReservedStocks(
         items: List<SaleItem>,
+        customer: Customer,
         location: Location
     ) {
-        items.forEach { item ->
-            stockService.cancelReservation(
-                productId = item.productId,
-                productName = item.productName,
-                locationId = location.id,
-                locationName = location.locationName,
-                quantity = item.quantity,
-                billId = 0,
-                billNo = ""
-            ).onFailure { error ->
-                Log.e(TAG, "库存释放失败: ${item.productName}, ${error.message}")
-            }
-        }
+        customerInboundStockService.releaseMultipleReservations(
+            customerNo = customer.customerNo,
+            items = items,
+            locationId = location.id
+        )
     }
 
     // === 根据库位加载商品 ===

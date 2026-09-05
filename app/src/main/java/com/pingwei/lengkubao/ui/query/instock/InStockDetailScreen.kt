@@ -14,11 +14,11 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.pingwei.lengkubao.ui.query.common.InStockQueryPrintDialog
 import com.pingwei.lengkubao.ui.query.instock.viewmodel.InStockDetailViewModel
 import com.pingwei.lengkubao.ui.theme.AppDimens
 import kotlinx.coroutines.launch
 import android.content.Context
-import android.widget.Toast
 import androidx.compose.material3.HorizontalDivider
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -87,6 +87,19 @@ fun InStockDetailScreen(
     val bill by viewModel.bill.collectAsState()
     val items by viewModel.items.collectAsState()
     val isLoading by viewModel.isLoading.collectAsState()
+    var showPrintDialog by remember { mutableStateOf(false) }
+
+    InStockQueryPrintDialog(
+        show = showPrintDialog,
+        bill = bill,
+        items = items,
+        onDismiss = { showPrintDialog = false },
+        onPrintSuccess = {
+            coroutineScope.launch {
+                viewModel.markPrinted()
+            }
+        }
+    )
 
     Scaffold(
         topBar = {
@@ -164,9 +177,14 @@ fun InStockDetailScreen(
                             Icon(Icons.Default.Edit, contentDescription = "修改")
                         }
 
-                        IconButton(onClick = {
-                            Toast.makeText(context, "打印功能开发中", Toast.LENGTH_SHORT).show()
-                        }) {
+                        IconButton(
+                            onClick = {
+                                if (items.isNotEmpty()) {
+                                    showPrintDialog = true
+                                }
+                            },
+                            enabled = items.isNotEmpty()
+                        ) {
                             Icon(Icons.Default.Print, contentDescription = "打印")
                         }
                     }

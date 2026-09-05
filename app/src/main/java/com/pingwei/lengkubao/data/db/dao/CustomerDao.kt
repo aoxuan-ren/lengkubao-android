@@ -21,6 +21,9 @@ interface CustomerDao {
     suspend fun updateCustomer(id: Long, customerName: String, phone: String)
     @Query("UPDATE customer SET sync_status = :status WHERE id = :id")
     suspend fun updateSyncStatus(id: Long, status: Int)
+
+    @Query("UPDATE customer SET enabled = :enabled, sync_status = 0, update_time = :updateTime WHERE id = :id")
+    suspend fun updateEnabledStatus(id: Long, enabled: Boolean, updateTime: Long = System.currentTimeMillis())
     @Query("SELECT * FROM customer ORDER BY customerNo ASC")
     fun getAllCustomers(): Flow<List<Customer>>
 
@@ -39,6 +42,18 @@ interface CustomerDao {
     // 按客户号删除
     @Query("DELETE FROM customer WHERE customerNo = :customerNo")
     suspend fun deleteByCustomerNo(customerNo: String)
+
+    @Query("DELETE FROM customer WHERE customer_type = :type")
+    suspend fun deleteAllByType(type: String)
+
+    @Query("DELETE FROM customer WHERE customer_type = :type AND customerNo NOT IN (:codes)")
+    suspend fun deleteByTypeExceptCodes(type: String, codes: List<String>)
+
+    @Query("DELETE FROM customer WHERE customerNo NOT IN (:codes)")
+    suspend fun deleteExceptCodes(codes: List<String>)
+
+    @Query("DELETE FROM customer")
+    suspend fun deleteAllCustomers()
 
     // 搜索客户（按名称或编号）
     @Query("SELECT * FROM customer WHERE customerName LIKE '%' || :keyword || '%' OR customerNo LIKE '%' || :keyword || '%'")

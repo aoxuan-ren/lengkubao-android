@@ -33,6 +33,7 @@ fun ProductQuantityPriceInput(
     existingPrice: Double,
     onQuantityChange: (Int, Double) -> Unit,
     isEnabled: Boolean = true,
+    stockLabel: String = "",
     modifier: Modifier = Modifier
 ) {
     val quantityText = if (existingQuantity > 0) existingQuantity.toString() else ""
@@ -73,12 +74,22 @@ fun ProductQuantityPriceInput(
                 )
 
                 Box(modifier = Modifier.weight(1f), contentAlignment = Alignment.Center) {
-                    Text(
-                        text = productWithStock.availableStock.toString(),
-                        style = MaterialTheme.typography.bodySmall,
-                        fontWeight = FontWeight.Medium,
-                        color = Color(0xFFFFA000)
-                    )
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        if (stockLabel.isNotEmpty()) {
+                            Text(
+                                text = stockLabel,
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.outline,
+                                maxLines = 1
+                            )
+                        }
+                        Text(
+                            text = productWithStock.availableStock.toString(),
+                            style = MaterialTheme.typography.bodySmall,
+                            fontWeight = FontWeight.Medium,
+                            color = Color(0xFFFFA000)
+                        )
+                    }
                 }
 
                 ProductInputBox(

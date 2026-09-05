@@ -43,6 +43,9 @@ data class PreSaleItem(
     @ColumnInfo(name = "quantity")
     val quantity: Int,
 
+    @ColumnInfo(name = "shipped_quantity")
+    val shippedQuantity: Int = 0,
+
     @ColumnInfo(name = "sale_price")
     val salePrice: Double,
 

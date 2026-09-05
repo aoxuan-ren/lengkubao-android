@@ -13,29 +13,25 @@ import androidx.room.PrimaryKey
             entity = PackagingBill::class,
             parentColumns = ["id"],
             childColumns = ["bill_id"],
-            onDelete = ForeignKey.CASCADE
-        )
+            onDelete = ForeignKey.CASCADE,
+        ),
     ],
     indices = [
-        Index(value = ["bill_id"])
-    ]
+        Index(value = ["bill_id"]),
+    ],
 )
 data class PackagingItem(
     @ColumnInfo(name = "bill_id")
     val billId: Long,
 
-    // 新增：明细级别的包装类型标记（可选，如果需要在明细级别区分）
     @ColumnInfo(name = "packaging_type_flag")
-    val packagingTypeFlag: String = "TAKE", // TAKE-取包装, RETURN-退包装
+    val packagingTypeFlag: String = "TAKE",
 
     @ColumnInfo(name = "packaging_type")
     val packagingType: String,
 
     @ColumnInfo(name = "packaging_type_id")
     val packagingTypeId: Long = 0,
-
-    @ColumnInfo(name = "packaging_type_no")
-    val packagingTypeNo: String = "",
 
     @ColumnInfo(name = "packaging_type_name")
     val packagingTypeName: String = "",
@@ -65,8 +61,7 @@ data class PackagingItem(
     val isPrinted: Boolean = false,
 
     @ColumnInfo(name = "is_synced")
-    val isSynced: Boolean = false
-
+    val isSynced: Boolean = false,
 ) {
     @PrimaryKey(autoGenerate = true)
     var itemId: Long = 0

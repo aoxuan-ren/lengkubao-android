@@ -16,6 +16,7 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
@@ -24,23 +25,29 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
+import androidx.core.content.ContextCompat
 import androidx.localbroadcastmanager.content.LocalBroadcastManager
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
 import com.pingwei.lengkubao.data.db.AppDatabase
+import com.pingwei.lengkubao.data.db.entity.CustomerType
 import com.pingwei.lengkubao.service.TcpSyncService
 import com.pingwei.lengkubao.service.model.PackagingItemPrint
 import com.pingwei.lengkubao.sync.TcpSyncManager
+import com.pingwei.lengkubao.utils.PackagingSyncHelper
 import com.pingwei.lengkubao.ui.common.printer.PrintStatus
 import com.pingwei.lengkubao.ui.common.printer.SaleBillPrinter
 import com.pingwei.lengkubao.ui.common.printer.SaleBillPrinterFactory
+import com.pingwei.lengkubao.ui.customer.CustomerAddActivity
 import com.pingwei.lengkubao.ui.instock.components.*
 import com.pingwei.lengkubao.ui.packaging.viewmodel.PackagingViewModel
 import com.pingwei.lengkubao.ui.packaging.viewmodel.PackagingInputItem
@@ -253,14 +260,15 @@ fun PackagingScreen(
     val context = LocalContext.current
     val coroutineScope = rememberCoroutineScope()
 
-    var showOperatorDialog by remember { mutableStateOf(false) }
     var showSaveSuccessDialog by remember { mutableStateOf(false) }
+    var showOperatorDialog by remember { mutableStateOf(false) }
     var showPrintDialog by remember { mutableStateOf(false) }
     var printMessage by remember { mutableStateOf("正在准备打印...") }
     var savedBillId by remember { mutableLongStateOf(0L) }
     var savedBillNo by remember { mutableStateOf("") }
     var isPrinting by remember { mutableStateOf(false) }
     var pendingChoiceDialog by remember { mutableStateOf(false) }
+    var syncStatusMessage by remember { mutableStateOf<String?>(null) }
 
     var localLastScannedCode by remember { mutableStateOf("") }
 
@@ -302,12 +310,56 @@ fun PackagingScreen(
         }
     }
 
+    val syncBroadcastReceiver = remember {
+        object : BroadcastReceiver() {
+            override fun onReceive(context: Context?, intent: Intent?) {
+                if (intent?.action != TcpSyncService.ACTION_SYNC_COMPLETE) return
+
+                val billType = intent.getStringExtra(TcpSyncService.EXTRA_BILL_TYPE_BROADCAST) ?: return
+                if (billType != "PACKAGING" && billType != "BATCH") return
+
+                val isSuccess = intent.getBooleanExtra(TcpSyncService.EXTRA_RESULT, false)
+                val errorMsg = intent.getStringExtra(TcpSyncService.EXTRA_ERROR_MSG).orEmpty()
+
+                syncStatusMessage = if (isSuccess) {
+                    if (billType == "BATCH") "批量同步已完成" else "包装单已同步到电脑"
+                } else {
+                    if (errorMsg.isNotBlank()) errorMsg else "同步失败，请检查电脑端同步服务"
+                }
+            }
+        }
+    }
+
     DisposableEffect(Unit) {
         val filter = IntentFilter(ACTION_SELECT_CUSTOMER)
         LocalBroadcastManager.getInstance(context).registerReceiver(broadcastReceiver, filter)
 
         onDispose {
             LocalBroadcastManager.getInstance(context).unregisterReceiver(broadcastReceiver)
+        }
+    }
+
+    DisposableEffect(Unit) {
+        val syncFilter = IntentFilter(TcpSyncService.ACTION_SYNC_COMPLETE)
+        ContextCompat.registerReceiver(
+            context,
+            syncBroadcastReceiver,
+            syncFilter,
+            ContextCompat.RECEIVER_NOT_EXPORTED
+        )
+
+        onDispose {
+            try {
+                context.unregisterReceiver(syncBroadcastReceiver)
+            } catch (_: IllegalArgumentException) {
+            }
+        }
+    }
+
+    LaunchedEffect(syncStatusMessage) {
+        syncStatusMessage?.let { message ->
+            Toast.makeText(context, message, Toast.LENGTH_LONG).show()
+            syncStatusMessage = null
         }
     }
 
@@ -327,7 +379,7 @@ fun PackagingScreen(
                 printMessage = "✅ 打印成功！"
                 isPrinting = false
                 if (showPrintDialog) {
-                    delay(800)
+                    Toast.makeText(context, "打印成功", Toast.LENGTH_SHORT).show()
                     showPostPrintChoiceDialog()
                 }
             }
@@ -335,7 +387,8 @@ fun PackagingScreen(
                 val error = printStatus as PrintStatus.Error
                 printMessage = "❌ ${error.message}"
                 isPrinting = false
-                if (showPrintDialog && pendingChoiceDialog) {
+                if (showPrintDialog) {
+                    Toast.makeText(context, "打印失败: ${error.message}", Toast.LENGTH_SHORT).show()
                     showPostPrintChoiceDialog()
                 }
             }
@@ -357,23 +410,6 @@ fun PackagingScreen(
         viewModel.initConfigManager(context)
     }
 
-    LaunchedEffect(selectedCustomer) {
-        selectedCustomer?.let {
-            localLastScannedCode = it.customerNo
-        }
-    }
-
-    if (showOperatorDialog) {
-        OperatorSelectorDialog(
-            operators = allOperators,
-            onDismiss = { showOperatorDialog = false },
-            onOperatorSelected = {
-                viewModel.selectOperator(it)
-                viewModel.saveAsDefaultHandler()
-            }
-        )
-    }
-
     val scrollState = rememberScrollState()
 
     Scaffold(
@@ -385,6 +421,25 @@ fun PackagingScreen(
                         horizontalArrangement = Arrangement.Center
                     ) {
                         Text("包装记账")
+                        IconButton(
+                            onClick = {
+                                context.startActivity(
+                                    Intent(context, CustomerAddActivity::class.java).apply {
+                                        putExtra(
+                                            CustomerAddActivity.EXTRA_CUSTOMER_TYPE,
+                                            CustomerType.SELLER
+                                        )
+                                    }
+                                )
+                            },
+                            modifier = Modifier.size(32.dp)
+                        ) {
+                            Icon(
+                                Icons.Default.Add,
+                                contentDescription = "添加卖家客户",
+                                modifier = Modifier.size(20.dp)
+                            )
+                        }
 
                         if (isScanning) {
                             Spacer(modifier = Modifier.width(8.dp))
@@ -421,8 +476,9 @@ fun PackagingScreen(
 
                     IconButton(
                         onClick = {
+                            TcpSyncService.startService(context)
                             TcpSyncService.syncPendingNow(context)
-                            Toast.makeText(context, "已提交后台同步请求", Toast.LENGTH_SHORT).show()
+                            Toast.makeText(context, "正在同步未完成单据…", Toast.LENGTH_SHORT).show()
                         }
                     ) {
                         Icon(
@@ -495,20 +551,12 @@ fun PackagingScreen(
                         .padding(AppDimens.pagePadding),
                     verticalArrangement = Arrangement.spacedBy(AppDimens.sectionSpacing)
                 ) {
-                    // ========== 1. 客户信息卡片 ==========
-                    Card(
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
+                    // 1. 客户 + 出/进（无标题）
+                    Card(modifier = Modifier.fillMaxWidth()) {
                         Column(
                             modifier = Modifier.padding(AppDimens.pagePadding),
                             verticalArrangement = Arrangement.spacedBy(12.dp)
                         ) {
-                            Text(
-                                text = "客户信息",
-                                style = MaterialTheme.typography.titleMedium,
-                                color = MaterialTheme.colorScheme.primary
-                            )
-
                             Row(
                                 modifier = Modifier.fillMaxWidth(),
                                 horizontalArrangement = Arrangement.spacedBy(AppDimens.itemSpacing),
@@ -521,187 +569,109 @@ fun PackagingScreen(
                                         viewModel.selectCustomer(customer)
                                     },
                                     modifier = Modifier.weight(1f),
-                                    isError = selectedCustomer == null
+                                    isError = selectedCustomer == null,
+                                    fieldHeight = 40.dp,
+                                    fieldTextStyle = MaterialTheme.typography.bodyMedium.copy(
+                                        fontSize = 15.sp,
+                                        fontWeight = FontWeight.Medium
+                                    ),
+                                    showFloatingLabel = false
                                 )
 
                                 IconButton(
                                     onClick = { onScanCustomer() },
-                                    modifier = Modifier.size(56.dp)
+                                    modifier = Modifier.size(48.dp)
                                 ) {
                                     Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                                        Icon(Icons.Default.QrCodeScanner, contentDescription = "扫码选择", Modifier.size(28.dp))
+                                        Icon(Icons.Default.QrCodeScanner, contentDescription = "扫码选择", Modifier.size(26.dp))
                                         Text("扫码", style = MaterialTheme.typography.labelSmall, fontSize = 9.sp)
                                     }
                                 }
                             }
-                        }
-                    }
-
-                    // ========== 1.5 包装类型选择卡片（新增） ==========
-                    Card(
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Column(
-                            modifier = Modifier.padding(AppDimens.pagePadding),
-                            verticalArrangement = Arrangement.spacedBy(12.dp)
-                        ) {
-                            Text(
-                                text = "包装类型",
-                                style = MaterialTheme.typography.titleMedium,
-                                color = MaterialTheme.colorScheme.primary
-                            )
 
                             Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.spacedBy(12.dp)
-                            ) {
-                                // 取包装选项
-                                Card(
-                                    modifier = Modifier
-                                        .weight(1f)
-                                        .clickable { viewModel.setPackagingTypeFlag("TAKE") },
-                                    colors = CardDefaults.cardColors(
-                                        containerColor = if (packagingTypeFlag == "TAKE")
-                                            MaterialTheme.colorScheme.primaryContainer
-                                        else MaterialTheme.colorScheme.surfaceVariant
-                                    ),
-                                    elevation = CardDefaults.cardElevation(
-                                        defaultElevation = if (packagingTypeFlag == "TAKE") 4.dp else 1.dp
-                                    )
-                                ) {
-                                    Column(
-                                        modifier = Modifier
-                                            .fillMaxWidth()
-                                            .padding(vertical = 8.dp),
-                                        horizontalAlignment = Alignment.CenterHorizontally
-                                    ) {
-                                        Icon(
-                                            Icons.Default.Outbound,
-                                            contentDescription = "取包装",
-                                            tint = if (packagingTypeFlag == "TAKE")
-                                                MaterialTheme.colorScheme.primary
-                                            else MaterialTheme.colorScheme.onSurfaceVariant,
-                                            modifier = Modifier.size(24.dp)
-                                        )
-                                        Spacer(modifier = Modifier.height(4.dp))
-                                        Text(
-                                            text = "取包装",
-                                            style = MaterialTheme.typography.titleSmall,
-                                            color = if (packagingTypeFlag == "TAKE")
-                                                MaterialTheme.colorScheme.primary
-                                            else MaterialTheme.colorScheme.onSurfaceVariant
-                                        )
-                                        Text(
-                                            text = "客户领取包装",
-                                            style = MaterialTheme.typography.labelSmall,
-                                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                                        )
-                                    }
-                                }
-
-                                // 退包装选项
-                                Card(
-                                    modifier = Modifier
-                                        .weight(1f)
-                                        .clickable { viewModel.setPackagingTypeFlag("RETURN") },
-                                    colors = CardDefaults.cardColors(
-                                        containerColor = if (packagingTypeFlag == "RETURN")
-                                            MaterialTheme.colorScheme.primaryContainer
-                                        else MaterialTheme.colorScheme.surfaceVariant
-                                    ),
-                                    elevation = CardDefaults.cardElevation(
-                                        defaultElevation = if (packagingTypeFlag == "RETURN") 4.dp else 1.dp
-                                    )
-                                ) {
-                                    Column(
-                                        modifier = Modifier
-                                            .fillMaxWidth()
-                                            .padding(vertical = 8.dp),
-                                        horizontalAlignment = Alignment.CenterHorizontally
-                                    ) {
-                                        Icon(
-                                            Icons.Default.ArrowBack,
-                                            contentDescription = "退包装",
-                                            tint = if (packagingTypeFlag == "RETURN")
-                                                MaterialTheme.colorScheme.primary
-                                            else MaterialTheme.colorScheme.onSurfaceVariant,
-                                            modifier = Modifier.size(24.dp)
-                                        )
-                                        Spacer(modifier = Modifier.height(4.dp))
-                                        Text(
-                                            text = "退包装",
-                                            style = MaterialTheme.typography.titleSmall,
-                                            color = if (packagingTypeFlag == "RETURN")
-                                                MaterialTheme.colorScheme.primary
-                                            else MaterialTheme.colorScheme.onSurfaceVariant
-                                        )
-                                        Text(
-                                            text = "客户退回包装",
-                                            style = MaterialTheme.typography.labelSmall,
-                                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                                        )
-                                    }
-                                }
-                            }
-
-                            // 添加说明文本
-                            Text(
-                                text = if (packagingTypeFlag == "TAKE")
-                                    "取包装：客户领取包装，金额计入应收账款"
-                                else "退包装：客户退回包装，金额从应收账款扣除",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                modifier = Modifier.padding(top = 4.dp)
-                            )
-                        }
-                    }
-
-                    // ========== 2. 包装明细卡片 ==========
-                    Card(
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Column(
-                            modifier = Modifier.padding(AppDimens.pagePadding)
-                        ) {
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.SpaceBetween,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(36.dp)
+                                    .clip(MaterialTheme.shapes.small)
+                                    .border(1.dp, MaterialTheme.colorScheme.outline, MaterialTheme.shapes.small),
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
-                                Text(
-                                    text = "包装明细",
-                                    style = MaterialTheme.typography.titleMedium
+                                Box(
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .fillMaxHeight()
+                                        .background(
+                                            if (packagingTypeFlag == "TAKE") {
+                                                MaterialTheme.colorScheme.primary
+                                            } else {
+                                                MaterialTheme.colorScheme.surface
+                                            }
+                                        )
+                                        .clickable { viewModel.setPackagingTypeFlag("TAKE") },
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Text(
+                                        "出",
+                                        style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
+                                        color = if (packagingTypeFlag == "TAKE") {
+                                            MaterialTheme.colorScheme.onPrimary
+                                        } else {
+                                            MaterialTheme.colorScheme.onSurfaceVariant
+                                        }
+                                    )
+                                }
+                                Box(
+                                    modifier = Modifier
+                                        .width(1.dp)
+                                        .fillMaxHeight()
+                                        .background(MaterialTheme.colorScheme.outline)
                                 )
-
-                                Text(
-                                    text = "已选: ${packagingInputs.count { it.quantity > 0 }} 种",
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.primary
-                                )
+                                Box(
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .fillMaxHeight()
+                                        .background(
+                                            if (packagingTypeFlag == "RETURN") {
+                                                MaterialTheme.colorScheme.primary
+                                            } else {
+                                                MaterialTheme.colorScheme.surface
+                                            }
+                                        )
+                                        .clickable { viewModel.setPackagingTypeFlag("RETURN") },
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Text(
+                                        "进",
+                                        style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
+                                        color = if (packagingTypeFlag == "RETURN") {
+                                            MaterialTheme.colorScheme.onPrimary
+                                        } else {
+                                            MaterialTheme.colorScheme.onSurfaceVariant
+                                        }
+                                    )
+                                }
                             }
+                        }
+                    }
 
-                            Spacer(modifier = Modifier.height(12.dp))
-
+                    // 2. 包装明细 + 备注 + 经手人（无分区标题）
+                    Card(modifier = Modifier.fillMaxWidth()) {
+                        Column(
+                            modifier = Modifier.padding(AppDimens.pagePadding),
+                            verticalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
                             if (packagingInputs.isEmpty()) {
                                 Box(
                                     modifier = Modifier
                                         .fillMaxWidth()
-                                        .height(80.dp),
+                                        .height(48.dp),
                                     contentAlignment = Alignment.Center
                                 ) {
-                                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                                        Icon(
-                                            Icons.Default.Inventory2,
-                                            contentDescription = "暂无包装类型",
-                                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                                            modifier = Modifier.size(32.dp)
-                                        )
-                                        Spacer(modifier = Modifier.height(8.dp))
-                                        Text(
-                                            text = "暂无包装类型",
-                                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                                        )
-                                    }
+                                    Text(
+                                        "暂无包装类型",
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
                                 }
                             } else {
                                 Column(
@@ -711,7 +681,7 @@ fun PackagingScreen(
                                     packagingInputs.forEach { inputItem ->
                                         OptimizedPackagingInputItem(
                                             inputItem = inputItem,
-                                            packagingTypeFlag = packagingTypeFlag, // 【新增】传入包装类型标记
+                                            packagingTypeFlag = packagingTypeFlag,
                                             onQuantityChange = { quantity ->
                                                 viewModel.updatePackagingQuantity(inputItem.packagingType.id, quantity)
                                             },
@@ -722,101 +692,67 @@ fun PackagingScreen(
                                     }
                                 }
 
-                                Spacer(modifier = Modifier.height(12.dp))
-
-                                Column(
-                                    verticalArrangement = Arrangement.spacedBy(AppDimens.itemSpacing)
+                                Divider()
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween
                                 ) {
-                                    Divider()
-                                    Row(
-                                        modifier = Modifier.fillMaxWidth(),
-                                        horizontalArrangement = Arrangement.SpaceBetween
-                                    ) {
-                                        Text("包装总金额：", style = MaterialTheme.typography.bodyMedium)
-                                        Text(
-                                            "¥${String.format("%.2f", totalAmount)}",
-                                            style = MaterialTheme.typography.bodyLarge,
-                                            color = if (packagingTypeFlag == "RETURN" && totalAmount > 0)
-                                                MaterialTheme.colorScheme.error
-                                            else MaterialTheme.colorScheme.primary
-                                        )
-                                    }
+                                    Text("包装总金额：", style = MaterialTheme.typography.bodyMedium)
+                                    Text(
+                                        "¥${String.format("%.2f", totalAmount)}",
+                                        style = MaterialTheme.typography.bodyLarge,
+                                        color = if (packagingTypeFlag == "RETURN" && totalAmount > 0)
+                                            MaterialTheme.colorScheme.error
+                                        else MaterialTheme.colorScheme.primary
+                                    )
                                 }
                             }
-                        }
-                    }
 
-                    // ========== 3. 经手人卡片 ==========
-                    Card(
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Column(
-                            modifier = Modifier.padding(AppDimens.pagePadding),
-                            verticalArrangement = Arrangement.spacedBy(12.dp)
-                        ) {
-                            Text(
-                                text = "其他信息",
-                                style = MaterialTheme.typography.titleMedium,
-                                color = MaterialTheme.colorScheme.primary
-                            )
-
-                            Box(
-                                modifier = Modifier.fillMaxWidth()
-                            ) {
-                                OutlinedTextField(
-                                    value = selectedOperator?.name ?: "请选择经手人",
-                                    onValueChange = {},
-                                    label = { Text("经手人") },
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .clickable { showOperatorDialog = true },
-                                    readOnly = true,
-                                    leadingIcon = {
-                                        Icon(Icons.Default.PersonOutline, contentDescription = "经手人")
-                                    },
-                                    trailingIcon = {
-                                        Row {
-                                            if (selectedOperator?.id == viewModel.getDefaultHandlerId()) {
-                                                Icon(
-                                                    Icons.Default.Star,
-                                                    contentDescription = "默认经手人",
-                                                    tint = MaterialTheme.colorScheme.primary,
-                                                    modifier = Modifier.size(20.dp)
-                                                )
-                                                Spacer(modifier = Modifier.width(4.dp))
-                                            }
-                                            IconButton(onClick = { showOperatorDialog = true }) {
-                                                Icon(Icons.Default.ArrowDropDown, contentDescription = "选择经手人")
-                                            }
-                                        }
-                                    },
-                                    isError = selectedOperator == null
-                                )
-                            }
-                        }
-                    }
-
-                    // ========== 4. 备注信息卡片 ==========
-                    Card(
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Column(
-                            modifier = Modifier.padding(AppDimens.pagePadding)
-                        ) {
-                            Text(
-                                text = "备注信息",
-                                style = MaterialTheme.typography.titleMedium,
-                                color = MaterialTheme.colorScheme.primary
-                            )
-
-                            Spacer(modifier = Modifier.height(8.dp))
-
-                            OutlinedTextField(
+                            Divider()
+                            BasicTextField(
                                 value = remark,
                                 onValueChange = { viewModel.setRemark(it) },
-                                label = { Text("请输入备注信息（可选）") },
-                                modifier = Modifier.fillMaxWidth(),
-                                maxLines = 3
+                                singleLine = true,
+                                textStyle = TextStyle(
+                                    fontSize = 14.sp,
+                                    color = MaterialTheme.colorScheme.onSurface
+                                ),
+                                cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(36.dp),
+                                decorationBox = { innerTextField ->
+                                    Box(
+                                        modifier = Modifier
+                                            .fillMaxSize()
+                                            .clip(MaterialTheme.shapes.small)
+                                            .border(
+                                                1.dp,
+                                                MaterialTheme.colorScheme.outline,
+                                                MaterialTheme.shapes.small
+                                            )
+                                            .padding(horizontal = 10.dp),
+                                        contentAlignment = Alignment.CenterStart
+                                    ) {
+                                        if (remark.isEmpty()) {
+                                            Text(
+                                                "备注（可选）",
+                                                style = MaterialTheme.typography.bodyMedium,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                                            )
+                                        }
+                                        innerTextField()
+                                    }
+                                }
+                            )
+
+                            CompactSelectField(
+                                text = selectedOperator?.name.orEmpty(),
+                                placeholder = "请选择",
+                                isError = selectedOperator == null,
+                                showDefaultStar = selectedOperator?.id == viewModel.getDefaultHandlerId(),
+                                onClick = { showOperatorDialog = true },
+                                modifier = Modifier.fillMaxWidth()
                             )
                         }
                     }
@@ -871,7 +807,7 @@ fun PackagingScreen(
                                     )
                                     Spacer(modifier = Modifier.width(4.dp))
                                     Text(
-                                        text = if (packagingTypeFlag == "TAKE") "取包装" else "退包装",
+                                        text = if (packagingTypeFlag == "TAKE") "出包装" else "进包装",
                                         style = MaterialTheme.typography.titleSmall,
                                         color = if (packagingTypeFlag == "TAKE")
                                             MaterialTheme.colorScheme.primary
@@ -923,6 +859,7 @@ fun PackagingScreen(
                                         savedBillNo = billNo
                                         pendingChoiceDialog = true
                                         showPrintDialog = true
+                                        PackagingSyncHelper.syncBillToServerAsync(context, billId)
                                     } else {
                                         Toast.makeText(
                                             context,
@@ -996,6 +933,18 @@ fun PackagingScreen(
         }
     }
 
+    if (showOperatorDialog) {
+        OperatorSelectorDialog(
+            operators = allOperators,
+            onDismiss = { showOperatorDialog = false },
+            onOperatorSelected = {
+                viewModel.selectOperator(it)
+                viewModel.saveAsDefaultHandler()
+                showOperatorDialog = false
+            }
+        )
+    }
+
     if (showSaveSuccessDialog) {
         AlertDialog(
             onDismissRequest = { },
@@ -1041,6 +990,8 @@ fun PackagingScreen(
                     if (bill == null || items.isEmpty()) {
                         printMessage = "获取单据信息失败"
                         isPrinting = false
+                        Toast.makeText(context, "获取单据信息失败", Toast.LENGTH_SHORT).show()
+                        showPostPrintChoiceDialog()
                         return@LaunchedEffect
                     }
 
@@ -1069,49 +1020,15 @@ fun PackagingScreen(
                 } catch (e: Exception) {
                     printMessage = "❌ 打印异常: ${e.message}"
                     isPrinting = false
+                    Toast.makeText(context, "打印失败: ${e.message}", Toast.LENGTH_SHORT).show()
+                    showPostPrintChoiceDialog()
                 }
             }
         }
-
-        AlertDialog(
-            onDismissRequest = { },
-            title = { Text("📄 打印包装单") },
-            text = {
-                Column(
-                    modifier = Modifier.padding(vertical = 8.dp),
-                    verticalArrangement = Arrangement.spacedBy(AppDimens.sectionSpacing)
-                ) {
-                    Text(printMessage)
-                    if (isPrinting) {
-                        Box(
-                            modifier = Modifier.fillMaxWidth(),
-                            contentAlignment = Alignment.Center
-                        ) {
-                            CircularProgressIndicator(
-                                modifier = Modifier.size(24.dp),
-                                strokeWidth = 2.dp
-                            )
-                        }
-                    }
-                }
-            },
-            confirmButton = {
-                TextButton(
-                    onClick = {
-                        if (!isPrinting) {
-                            showPostPrintChoiceDialog()
-                        }
-                    },
-                    enabled = !isPrinting
-                ) {
-                    Text("确定")
-                }
-            }
-        )
     }
 }
 
-// OptimizedPackagingInputItem 组件 - 添加取/退标记支持
+// OptimizedPackagingInputItem 组件 - 添加出/进标记支持
 @Composable
 fun OptimizedPackagingInputItem(
     inputItem: PackagingInputItem,
@@ -1130,7 +1047,7 @@ fun OptimizedPackagingInputItem(
     var showCustomKeyboard by remember { mutableStateOf(false) }
     var activeInputField by remember { mutableStateOf<InputField?>(null) }
 
-    // 【新增】根据取/退标记调整背景色
+    // 【新增】根据出/进标记调整背景色
     val itemBackgroundColor = if (packagingTypeFlag == "RETURN")
         MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.3f)
     else MaterialTheme.colorScheme.surfaceVariant

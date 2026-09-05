@@ -24,6 +24,7 @@ import android.content.Context
 import android.widget.Toast
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.MoreVert
+import com.pingwei.lengkubao.ui.query.common.SaleOutQueryPrintDialog
 import com.pingwei.lengkubao.ui.query.saleout.viewmodel.SaleOutDetailViewModel
 import com.pingwei.lengkubao.ui.theme.AppDimens
 
@@ -93,11 +94,24 @@ fun SaleOutDetailScreen(
     val bill by viewModel.bill.collectAsState()
     val items by viewModel.items.collectAsState()
     val isLoading by viewModel.isLoading.collectAsState()
+    var showPrintDialog by remember { mutableStateOf(false) }
+
+    SaleOutQueryPrintDialog(
+        show = showPrintDialog,
+        bill = bill,
+        items = items,
+        onDismiss = { showPrintDialog = false },
+        onPrintSuccess = {
+            coroutineScope.launch {
+                viewModel.markPrinted()
+            }
+        }
+    )
 
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("销售单详情") },
+                title = { Text("报账单详情") },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
                         Icon(Icons.Default.ArrowBack, contentDescription = "返回")
@@ -126,8 +140,8 @@ fun SaleOutDetailScreen(
                                         expanded = false
                                         showPhysicalDeleteConfirmation(
                                             context,
-                                            "物理删除销售单",
-                                            "彻底删除销售单和明细数据，同时恢复库存。此操作不可恢复！"
+                                            "物理删除报账单",
+                                            "彻底删除报账单和明细数据，同时恢复库存。此操作不可恢复！"
                                         ) {
                                             coroutineScope.launch {
                                                 viewModel.deleteBillPermanently()
@@ -152,7 +166,7 @@ fun SaleOutDetailScreen(
                                             coroutineScope.launch {
                                                 val result = viewModel.voidBill()
                                                 if (result) {
-                                                    Toast.makeText(context, "销售单已作废", Toast.LENGTH_SHORT).show()
+                                                    Toast.makeText(context, "报账单已作废", Toast.LENGTH_SHORT).show()
                                                 } else {
                                                     Toast.makeText(context, "作废失败", Toast.LENGTH_SHORT).show()
                                                 }
@@ -181,13 +195,8 @@ fun SaleOutDetailScreen(
                                     text = { Text("打印") },
                                     onClick = {
                                         expanded = false
-                                        coroutineScope.launch {
-                                            val result = viewModel.printBill()
-                                            if (result) {
-                                                Toast.makeText(context, "打印状态已更新", Toast.LENGTH_SHORT).show()
-                                            } else {
-                                                Toast.makeText(context, "打印失败", Toast.LENGTH_SHORT).show()
-                                            }
+                                        if (items.isNotEmpty()) {
+                                            showPrintDialog = true
                                         }
                                     },
                                     leadingIcon = {
@@ -196,14 +205,25 @@ fun SaleOutDetailScreen(
                                 )
                             }
                         }
+
+                        IconButton(
+                            onClick = {
+                                if (items.isNotEmpty()) {
+                                    showPrintDialog = true
+                                }
+                            },
+                            enabled = items.isNotEmpty()
+                        ) {
+                            Icon(Icons.Default.Print, contentDescription = "打印")
+                        }
                     } else if (bill != null) {
                         // 已作废单据只显示物理删除选项
                         IconButton(
                             onClick = {
                                 showPhysicalDeleteConfirmation(
                                     context,
-                                    "物理删除已作废销售单",
-                                    "此销售单已作废，确定要彻底删除吗？删除后库存将恢复。此操作不可恢复！"
+                                    "物理删除已作废报账单",
+                                    "此报账单已作废，确定要彻底删除吗？删除后库存将恢复。此操作不可恢复！"
                                 ) {
                                     coroutineScope.launch {
                                         viewModel.deleteBillPermanently()
@@ -234,7 +254,7 @@ fun SaleOutDetailScreen(
                 modifier = Modifier.fillMaxSize(),
                 contentAlignment = Alignment.Center
             ) {
-                Text("销售单不存在或已删除")
+                Text("报账单不存在或已删除")
             }
         } else {
             Column(
@@ -259,7 +279,7 @@ fun SaleOutDetailScreen(
                         BillInfoRow(label = "库位", value = bill!!.locationName ?: "无")
                         BillInfoRow(label = "经手人", value = bill!!.operatorName ?: "未知")
                         BillInfoRow(label = "开单时间", value = formatTime(bill!!.createTime))
-                        BillInfoRow(label = "销售总量", value = "${bill!!.totalQuantity}${items.firstOrNull()?.unit ?: "件"}")
+                        BillInfoRow(label = "报账总量", value = "${bill!!.totalQuantity}${items.firstOrNull()?.unit ?: "件"}")
                         BillInfoRow(label = "状态", value = getStatusText(bill!!.status))
                         BillInfoRow(label = "同步状态", value = getSyncStatusText(bill!!.syncStatus))
                         if (bill!!.remark.isNotBlank()) {
@@ -471,7 +491,7 @@ private fun getSyncStatusText(syncStatus: Int): String {
 private fun showVoidConfirmation(context: Context, onConfirm: () -> Unit) {
     android.app.AlertDialog.Builder(context)
         .setTitle("确认作废")
-        .setMessage("确定要作废此销售单吗？此操作不可撤销。")
+        .setMessage("确定要作废此报账单吗？此操作不可撤销。")
         .setPositiveButton("确定作废") { _, _ -> onConfirm() }
         .setNegativeButton("取消", null)
         .show()

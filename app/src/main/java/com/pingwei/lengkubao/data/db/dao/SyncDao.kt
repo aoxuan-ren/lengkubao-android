@@ -10,6 +10,9 @@ import com.pingwei.lengkubao.data.db.entity.SyncLocalOpLog
 
 @Dao
 interface SyncDao {
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertLocalOp(op: SyncLocalOpLog)
+
     @Query("SELECT * FROM sync_local_oplog WHERE pushed_at IS NULL ORDER BY id ASC LIMIT :limit")
     suspend fun getPendingLocalOps(limit: Int = 500): List<SyncLocalOpLog>
 
@@ -55,6 +58,9 @@ interface SyncDao {
         """
     )
     suspend fun isApplied(originDeviceId: String, originOpId: String): Boolean
+
+    @Query("SELECT COUNT(*) FROM sync_local_oplog WHERE pushed_at IS NULL AND entity_type = :entityType")
+    suspend fun countPendingOpsByEntityType(entityType: String): Int
 
     @Query("UPDATE sync_runtime_flags SET suppress_local_log = :suppress WHERE id = 1")
     suspend fun setSuppressLocalLog(suppress: Boolean)

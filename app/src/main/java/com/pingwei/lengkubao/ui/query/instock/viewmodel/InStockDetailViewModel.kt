@@ -167,4 +167,18 @@ class InStockDetailViewModel(application: Application) : AndroidViewModel(applic
     fun clearOperationResult() {
         _operationResult.value = null
     }
+
+    suspend fun markPrinted(): Boolean {
+        return try {
+            val currentBill = _bill.value ?: return false
+            database.inStockBillDao().update(
+                currentBill.copy(printTime = System.currentTimeMillis())
+            )
+            loadBill(currentBill.id)
+            true
+        } catch (e: Exception) {
+            Log.e(TAG, "❌ 更新打印时间失败", e)
+            false
+        }
+    }
 }

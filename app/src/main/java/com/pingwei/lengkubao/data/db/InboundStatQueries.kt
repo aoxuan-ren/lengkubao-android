@@ -17,7 +17,7 @@ object InboundStatQueries {
         val sql = """
         SELECT 
             b.location_id as locationId,
-            l.location_no as locationNo,
+            l.location_name as locationNo,
             l.location_name as locationName,
             i.product_id as productId,
             p.productNo as productNo,
@@ -31,9 +31,9 @@ object InboundStatQueries {
         INNER JOIN product p ON i.product_id = p.id
         WHERE (${if (customerNo == null) "?" else "b.customer_no = ?"})
             AND b.create_time BETWEEN ? AND ?
-            AND b.status = 'COMPLETED'  -- 修改这里！
-        GROUP BY b.location_id, l.location_no, l.location_name, i.product_id, p.productNo, p.productName
-        ORDER BY l.location_no, p.productNo
+            AND b.status IN ('COMPLETED', '1')
+        GROUP BY b.location_id, l.location_name, i.product_id, p.productNo, p.productName
+        ORDER BY l.location_name, p.productNo
     """.trimIndent()
 
         val args = mutableListOf<Any>()
@@ -69,7 +69,7 @@ object InboundStatQueries {
         INNER JOIN in_stock_bill b ON i.bill_id = b.id
         WHERE (${if (customerNo == null) "?" else "b.customer_no = ?"})
             AND b.create_time BETWEEN ? AND ?
-            AND b.status = 'COMPLETED'  -- 改为 COMPLETED
+            AND b.status IN ('COMPLETED', '1')
     """.trimIndent()
 
         val args = mutableListOf<Any>()

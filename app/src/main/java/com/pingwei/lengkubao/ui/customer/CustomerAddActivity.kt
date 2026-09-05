@@ -20,6 +20,7 @@ import androidx.compose.ui.unit.sp
 import com.pingwei.lengkubao.LengKuBaoApplication
 import com.pingwei.lengkubao.data.db.entity.Customer
 import com.pingwei.lengkubao.utils.CustomerCodeGenerator // 导入代码生成器
+import com.pingwei.lengkubao.utils.SyncTrigger
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -88,6 +89,7 @@ class CustomerAddActivity : ComponentActivity() {
 
                 withContext(Dispatchers.Main) {
                     if (result > 0) {
+                        SyncTrigger.triggerCustomerSync(this@CustomerAddActivity, result)
                         showToast("客户添加成功")
                         finish()
                     } else {

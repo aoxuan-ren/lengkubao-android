@@ -42,7 +42,6 @@ class StockService(
                     productNo = "", // 需要从其他地方获取
                     productName = productName,
                     locationId = locationId,
-                    locationNo = "", // 需要从其他地方获取
                     currentQuantity = addQuantity,
                     reservedQuantity = 0,
                     lastUpdated = System.currentTimeMillis(),
@@ -132,7 +131,6 @@ class StockService(
         billId: Long,
         billNo: String,
         items: List<InStockItem>,
-        locationNo: String
     ): Boolean = withContext(Dispatchers.IO) {
         return@withContext try {
             Log.d(TAG, "📦 批量增加库存: 商品=$productName, 数量=$addQuantity, 库位=$locationName")

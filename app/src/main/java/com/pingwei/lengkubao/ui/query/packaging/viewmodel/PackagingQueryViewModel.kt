@@ -37,6 +37,7 @@ class PackagingQueryViewModel(application: Application) : AndroidViewModel(appli
         startTime = QueryTimeRangeUtils.getStartTime(defaultTimeRangeLabel),
         endTime = QueryTimeRangeUtils.getEndTime(defaultTimeRangeLabel)
     )
+    private var allBills = emptyList<PackagingBill>()
 
     val savedTimeRangeLabel: String = defaultTimeRangeLabel
 
@@ -45,10 +46,19 @@ class PackagingQueryViewModel(application: Application) : AndroidViewModel(appli
         observeDatabaseChanges()
     }
 
+    /** 输入时即时按单据号/客户/首字母过滤，不触发加载态 */
+    fun updateKeyword(keyword: String?) {
+        currentSearchParams = currentSearchParams.copy(
+            keyword = keyword?.takeIf { it.isNotBlank() }
+        )
+        _bills.value = filterBillsByParams(allBills, currentSearchParams)
+    }
+
     private fun observeDatabaseChanges() {
         viewModelScope.launch {
             database.packagingBillDao().getAllBills().collect { billList ->
                 Log.d(TAG, "📊 数据库数据变化，收到 ${billList.size} 条记录")
+                allBills = billList
                 _bills.value = filterBillsByParams(billList, currentSearchParams)
             }
         }
@@ -96,6 +106,7 @@ class PackagingQueryViewModel(application: Application) : AndroidViewModel(appli
         )
 
         val billList = database.packagingBillDao().getAllBills().first()
+        allBills = billList
         Log.d(TAG, "📋 共有 ${billList.size} 张单据可供筛选")
         val filtered = filterBillsByParams(billList, currentSearchParams)
         Log.d(TAG, "🎯 搜索到 ${filtered.size} 张单据")

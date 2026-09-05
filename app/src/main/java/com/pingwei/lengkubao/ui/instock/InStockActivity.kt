@@ -1,6 +1,7 @@
 package com.pingwei.lengkubao.ui.instock
 
 import android.annotation.SuppressLint
+import android.content.Intent
 import android.os.Bundle
 import android.util.Log
 import android.view.KeyEvent
@@ -14,6 +15,7 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
@@ -23,7 +25,9 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
@@ -36,13 +40,17 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
 import com.pingwei.lengkubao.data.db.AppDatabase
+import com.pingwei.lengkubao.data.db.entity.CustomerType
+import com.pingwei.lengkubao.data.db.entity.Deduction
 import com.pingwei.lengkubao.service.SunmiPrintService
 import com.pingwei.lengkubao.service.SunmiScannerService
 import com.pingwei.lengkubao.service.model.InStockItemPrint
 import com.pingwei.lengkubao.ui.common.printer.PrintStatus
 import com.pingwei.lengkubao.ui.common.printer.SaleBillPrinter
 import com.pingwei.lengkubao.ui.common.printer.SaleBillPrinterFactory
+import com.pingwei.lengkubao.ui.customer.CustomerAddActivity
 import com.pingwei.lengkubao.ui.instock.components.*
+import com.pingwei.lengkubao.ui.instock.viewmodel.FeeRemarkType
 import com.pingwei.lengkubao.ui.instock.viewmodel.InStockViewModel
 import com.pingwei.lengkubao.ui.theme.AppDimens
 import com.pingwei.lengkubao.ui.theme.LengkubaoTheme
@@ -107,8 +115,9 @@ class InStockActivity : ComponentActivity() {
         // 注册广播接收器
         scannerReceiver.register()
 
-        // 初始化ViewModel
+        // 初始化ViewModel，并提前加载默认库位/经手人，避免进入后再跳变
         viewModel = InStockViewModel(application)
+        viewModel.initConfigManager(this)
 
         setContent {
             LengkubaoTheme {
@@ -361,11 +370,10 @@ fun InStockScreen(
     val printStatus by printerViewModel?.printStatus?.collectAsState(initial = PrintStatus.Idle)
         ?: remember { mutableStateOf(PrintStatus.Idle) }
 
-    // 初始化配置管理器 - 页面启动仅执行一次
+    // 配置已在 Activity.onCreate 提前初始化，这里仅兜底
     LaunchedEffect(Unit) {
         try {
             viewModel.initConfigManager(context)
-            Log.d(TAG, "✅ 页面启动，初始化ConfigManager完成")
         } catch (e: Exception) {
             Log.e(TAG, "❌ 初始化ConfigManager失败", e)
             Toast.makeText(context, "配置初始化失败：${e.message}", Toast.LENGTH_LONG).show()
@@ -380,6 +388,8 @@ fun InStockScreen(
     var printMessage by remember { mutableStateOf("正在准备打印...") }
     var savedBillId by remember { mutableLongStateOf(0L) }
     var savedBillNo by remember { mutableStateOf("") }
+    var savedDeduction by remember { mutableStateOf<Deduction?>(null) }
+    var deductionPrintDone by remember { mutableStateOf(false) }
     var isPrinting by remember { mutableStateOf(false) }
     var pendingChoiceDialog by remember { mutableStateOf(false) }
 
@@ -388,12 +398,21 @@ fun InStockScreen(
     val selectedLocation by viewModel.selectedLocation.collectAsState()
     val selectedOperator by viewModel.selectedOperator.collectAsState()
     val productInputs by viewModel.productInputs.collectAsState()
+    val isLoading by viewModel.isLoading.collectAsState()
     val totalAmount by viewModel.totalAmount.collectAsState()
     val totalQuantity by viewModel.totalQuantity.collectAsState()
-    val remark by viewModel.remark.collectAsState()
+    val remarkNote by viewModel.remarkNote.collectAsState()
+    val includeShippingFeeRemark by viewModel.includeShippingFeeRemark.collectAsState()
+    val includePackagingFeeRemark by viewModel.includePackagingFeeRemark.collectAsState()
+    val deductionUnitPrice by viewModel.deductionUnitPrice.collectAsState()
     val allCustomers = viewModel.allCustomers.collectAsState(initial = emptyList()).value
     val locations = viewModel.allLocations.collectAsState(initial = emptyList()).value
     val operators = viewModel.allOperators.collectAsState(initial = emptyList()).value
+
+    val deductionAmountDisplay = when {
+        totalQuantity <= 0 || deductionUnitPrice.isBlank() -> ""
+        else -> String.format("%.2f", viewModel.calculateDeductionAmount(totalQuantity, deductionUnitPrice))
+    }
 
     fun showPostPrintChoiceDialog() {
         pendingChoiceDialog = false
@@ -405,20 +424,57 @@ fun InStockScreen(
     LaunchedEffect(printStatus) {
         when (printStatus) {
             is PrintStatus.Success -> {
-                printMessage = "✅ 打印成功！"
                 isPrinting = false
-                if (showPrintDialog) {
-                    delay(800)
-                    showPostPrintChoiceDialog()
+                if (!showPrintDialog) return@LaunchedEffect
+
+                val deduction = savedDeduction
+                if (deduction != null && !deductionPrintDone) {
+                    deductionPrintDone = true
+                    printMessage = "正在打印扣款单..."
+                    isPrinting = true
+                    try {
+                        val printService = SunmiPrintService.getInstance(context)
+                        val printed = printService?.printDeductionBill(
+                            customerName = deduction.customerName,
+                            customerNo = deduction.customerNo,
+                            quantity = deduction.quantity,
+                            unitPrice = deduction.unitPrice,
+                            amount = deduction.amount,
+                            reason = deduction.reason ?: "",
+                            handler = deduction.handler ?: "",
+                            deductDate = deduction.deductDate
+                        ) ?: false
+                        printMessage = if (printed) {
+                            "✅ 入库单和扣款单打印成功"
+                        } else {
+                            "✅ 入库单已打印，扣款单打印失败"
+                        }
+                        if (printed) {
+                            Toast.makeText(context, "扣款单打印成功", Toast.LENGTH_SHORT).show()
+                        } else {
+                            Toast.makeText(context, "扣款已保存，但扣款单打印失败", Toast.LENGTH_SHORT).show()
+                        }
+                    } catch (e: Exception) {
+                        printMessage = "✅ 入库单已打印，扣款单打印失败"
+                        Toast.makeText(context, "扣款已保存，打印失败: ${e.message}", Toast.LENGTH_SHORT).show()
+                        Log.e(TAG, "❌ 扣款单打印失败", e)
+                    } finally {
+                        isPrinting = false
+                    }
+                } else {
+                    printMessage = "✅ 打印成功！"
+                    Toast.makeText(context, "打印成功", Toast.LENGTH_SHORT).show()
                 }
-                Toast.makeText(context, "打印成功", Toast.LENGTH_SHORT).show()
+
+                showPostPrintChoiceDialog()
             }
             is PrintStatus.Error -> {
                 val error = printStatus as PrintStatus.Error
                 printMessage = "❌ ${error.message}"
                 isPrinting = false
                 Log.e(TAG, "❌ 打印失败: ${error.message}")
-                if (showPrintDialog && pendingChoiceDialog) {
+                if (showPrintDialog) {
+                    Toast.makeText(context, "打印失败: ${error.message}", Toast.LENGTH_SHORT).show()
                     showPostPrintChoiceDialog()
                 }
             }
@@ -472,7 +528,14 @@ fun InStockScreen(
         AlertDialog(
             onDismissRequest = { },
             title = { Text("✅ 保存成功") },
-            text = { Text("入库单 $savedBillNo 已保存并打印，是否再打印一张？") },
+            text = {
+                val deductionHint = if (savedDeduction != null) {
+                    "，扣款单已生成（可在预支扣款查看，待TCP同步）"
+                } else {
+                    ""
+                }
+                Text("入库单 $savedBillNo 已保存并打印$deductionHint，是否再打印一张？")
+            },
             confirmButton = {
                 TextButton(
                     onClick = {
@@ -491,6 +554,8 @@ fun InStockScreen(
                         viewModel.clearAll()
                         savedBillId = 0L
                         savedBillNo = ""
+                        savedDeduction = null
+                        deductionPrintDone = false
                     },
                     enabled = !isPrinting
                 ) {
@@ -500,7 +565,7 @@ fun InStockScreen(
         )
     }
 
-    // 打印对话框 - 【修复】全量异常捕获、打印机服务判空
+    // 后台静默打印（无中间弹窗）
     if (showPrintDialog) {
         LaunchedEffect(showPrintDialog) {
             try {
@@ -516,6 +581,8 @@ fun InStockScreen(
                         printMessage = "❌ 获取单据信息失败，无数据"
                         isPrinting = false
                         Log.e(TAG, "❌ 打印失败：单据/明细为空，ID: $savedBillId")
+                        Toast.makeText(context, "获取单据信息失败", Toast.LENGTH_SHORT).show()
+                        showPostPrintChoiceDialog()
                         return@LaunchedEffect
                     }
 
@@ -534,6 +601,8 @@ fun InStockScreen(
                         printMessage = "❌ 打印机服务未初始化"
                         isPrinting = false
                         Log.e(TAG, "❌ 打印失败：SunmiPrintService为null")
+                        Toast.makeText(context, "打印机服务未初始化", Toast.LENGTH_SHORT).show()
+                        showPostPrintChoiceDialog()
                         return@LaunchedEffect
                     }
 
@@ -563,6 +632,8 @@ fun InStockScreen(
                         printMessage = "❌ 打印机连接失败，请检查设备"
                         isPrinting = false
                         Log.e(TAG, "❌ 打印机3次连接均失败")
+                        Toast.makeText(context, "打印机连接失败，请检查设备", Toast.LENGTH_SHORT).show()
+                        showPostPrintChoiceDialog()
                         return@LaunchedEffect
                     }
 
@@ -585,6 +656,8 @@ fun InStockScreen(
                         printMessage = "❌ 打印服务初始化失败"
                         isPrinting = false
                         Log.e(TAG, "❌ 打印失败：printerViewModel为null")
+                        Toast.makeText(context, "打印服务初始化失败", Toast.LENGTH_SHORT).show()
+                        showPostPrintChoiceDialog()
                     }
                 }
             } catch (e: Exception) {
@@ -592,31 +665,9 @@ fun InStockScreen(
                 isPrinting = false
                 Toast.makeText(context, "打印准备失败: ${e.message}", Toast.LENGTH_LONG).show()
                 Log.e(TAG, "❌ 打印流程未捕获异常", e)
+                showPostPrintChoiceDialog()
             }
         }
-
-        AlertDialog(
-            onDismissRequest = { },
-            title = { Text("打印入库单") },
-            text = {
-                Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    Text(printMessage, textAlign = TextAlign.Center)
-                    if (isPrinting) {
-                        Spacer(modifier = Modifier.height(16.dp))
-                        CircularProgressIndicator(modifier = Modifier.size(32.dp))
-                    }
-                }
-            },
-            confirmButton = {
-                if (!isPrinting) {
-                    TextButton(
-                        onClick = { showPostPrintChoiceDialog() }
-                    ) {
-                        Text("确定")
-                    }
-                }
-            }
-        )
     }
 
     // 滚动状态
@@ -632,6 +683,25 @@ fun InStockScreen(
                             horizontalArrangement = Arrangement.Center
                         ) {
                             Text("入库开单")
+                            IconButton(
+                                onClick = {
+                                    context.startActivity(
+                                        Intent(context, CustomerAddActivity::class.java).apply {
+                                            putExtra(
+                                                CustomerAddActivity.EXTRA_CUSTOMER_TYPE,
+                                                CustomerType.SELLER
+                                            )
+                                        }
+                                    )
+                                },
+                                modifier = Modifier.size(32.dp)
+                            ) {
+                                Icon(
+                                    Icons.Default.Add,
+                                    contentDescription = "添加卖家客户",
+                                    modifier = Modifier.size(20.dp)
+                                )
+                            }
                             if (isScanning) {
                                 Spacer(modifier = Modifier.width(8.dp))
                                 Icon(
@@ -735,18 +805,12 @@ fun InStockScreen(
                         .padding(AppDimens.pagePadding),
                     verticalArrangement = Arrangement.spacedBy(AppDimens.sectionSpacing)
                 ) {
-                    // 1. 客户信息卡片
+                    // 1. 客户 + 库位/经手人（无分区标题）
                     Card(modifier = Modifier.fillMaxWidth()) {
                         Column(
                             modifier = Modifier.padding(AppDimens.pagePadding),
                             verticalArrangement = Arrangement.spacedBy(12.dp)
                         ) {
-                            Text(
-                                text = "客户信息",
-                                style = MaterialTheme.typography.titleMedium,
-                                color = MaterialTheme.colorScheme.primary
-                            )
-
                             Row(
                                 modifier = Modifier.fillMaxWidth(),
                                 horizontalArrangement = Arrangement.spacedBy(AppDimens.itemSpacing),
@@ -762,62 +826,77 @@ fun InStockScreen(
                                         }
                                     },
                                     modifier = Modifier.weight(1f),
-                                    isError = selectedCustomer == null
+                                    isError = selectedCustomer == null,
+                                    fieldHeight = 40.dp,
+                                    fieldTextStyle = MaterialTheme.typography.bodyMedium.copy(
+                                        fontSize = 15.sp,
+                                        fontWeight = FontWeight.Medium
+                                    ),
+                                    fieldLabelStyle = MaterialTheme.typography.bodyMedium.copy(fontSize = 14.sp),
+                                    showFloatingLabel = false
                                 )
 
-                                // 扫码按钮
                                 IconButton(
                                     onClick = { onScanCustomer() },
-                                    modifier = Modifier.size(56.dp)
+                                    modifier = Modifier.size(48.dp)
                                 ) {
                                     Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                                        Icon(Icons.Default.QrCodeScanner, contentDescription = "扫码选择", Modifier.size(28.dp))
+                                        Icon(Icons.Default.QrCodeScanner, contentDescription = "扫码选择", Modifier.size(26.dp))
                                         Text("扫码", style = MaterialTheme.typography.labelSmall, fontSize = 9.sp)
                                     }
                                 }
                             }
 
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                CompactSelectField(
+                                    text = selectedLocation?.locationName.orEmpty(),
+                                    placeholder = "请选择库位",
+                                    isError = selectedLocation == null,
+                                    showDefaultStar = selectedLocation?.id == viewModel.getDefaultLocationId(),
+                                    onClick = { showLocationDialog = true },
+                                    modifier = Modifier.weight(1f)
+                                )
+                                CompactSelectField(
+                                    text = selectedOperator?.name.orEmpty(),
+                                    placeholder = "请选择",
+                                    isError = selectedOperator == null,
+                                    showDefaultStar = selectedOperator?.id == viewModel.getDefaultHandlerId(),
+                                    onClick = { showOperatorDialog = true },
+                                    modifier = Modifier.weight(1f)
+                                )
+                            }
                         }
                     }
 
-                    // 2. 商品明细卡片 - 简化版（完全固定，不限制高度）
+                    // 2. 商品明细 + 扣款与备注（无分区标题）
                     Card(modifier = Modifier.fillMaxWidth()) {
-                        Column(modifier = Modifier.padding(AppDimens.pagePadding)) {
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.SpaceBetween,
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Text("商品明细", style = MaterialTheme.typography.titleMedium)
-                                Text(
-                                    "已选: ${productInputs.count { it.quantity > 0 }} 种",
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.primary
-                                )
-                            }
-
-                            Spacer(modifier = Modifier.height(12.dp))
-
-                            if (productInputs.isEmpty()) {
+                        Column(
+                            modifier = Modifier.padding(AppDimens.pagePadding),
+                            verticalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            if (isLoading && productInputs.isEmpty()) {
                                 Box(
                                     modifier = Modifier
                                         .fillMaxWidth()
                                         .height(80.dp),
                                     contentAlignment = Alignment.Center
                                 ) {
-                                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                                        Icon(
-                                            Icons.Default.Inventory,
-                                            contentDescription = "暂无商品",
-                                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                                            modifier = Modifier.size(32.dp)
-                                        )
-                                        Spacer(modifier = Modifier.height(8.dp))
-                                        Text("暂无商品型号", color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                    }
+                                    CircularProgressIndicator(modifier = Modifier.size(28.dp), strokeWidth = 2.dp)
+                                }
+                            } else if (productInputs.isEmpty()) {
+                                Box(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .height(48.dp),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Text("暂无商品型号", color = MaterialTheme.colorScheme.onSurfaceVariant)
                                 }
                             } else {
-                                // 【修复】使用Column代替LazyColumn，商品明细完全展开
                                 Column(
                                     verticalArrangement = Arrangement.spacedBy(2.dp),
                                     modifier = Modifier.fillMaxWidth()
@@ -833,109 +912,132 @@ fun InStockScreen(
                                 }
                             }
 
-                            Spacer(modifier = Modifier.height(12.dp))
                             Divider()
                             Row(
                                 modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.SpaceBetween
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                verticalAlignment = Alignment.CenterVertically
                             ) {
-                                Text("总计数量：", style = MaterialTheme.typography.bodyMedium)
-                                Text("$totalQuantity", style = MaterialTheme.typography.bodyLarge)
-                            }
-                        }
-                    }
-
-                    // 3. 库位和经手人卡片
-                    Card(modifier = Modifier.fillMaxWidth()) {
-                        Column(
-                            modifier = Modifier.padding(AppDimens.pagePadding),
-                            verticalArrangement = Arrangement.spacedBy(12.dp)
-                        ) {
-                            Text(
-                                text = "其他信息",
-                                style = MaterialTheme.typography.titleMedium,
-                                color = MaterialTheme.colorScheme.primary
-                            )
-
-                            // 库位选择
-                            Box(modifier = Modifier.fillMaxWidth()) {
-                                OutlinedTextField(
-                                    value = selectedLocation?.let { "${it.locationName} (${it.locationNo})" } ?: "请选择库位",
-                                    onValueChange = {},
-                                    label = { Text("库位") },
+                                Text("总计数量", style = MaterialTheme.typography.bodyMedium)
+                                Text(
+                                    "$totalQuantity",
+                                    style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold)
+                                )
+                                Text("单价", style = MaterialTheme.typography.bodyMedium)
+                                BasicTextField(
+                                    value = deductionUnitPrice,
+                                    onValueChange = { viewModel.setDeductionUnitPrice(it) },
+                                    singleLine = true,
+                                    textStyle = TextStyle(
+                                        fontSize = 16.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        color = MaterialTheme.colorScheme.onSurface,
+                                        textAlign = TextAlign.Center
+                                    ),
+                                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                                    cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
                                     modifier = Modifier
-                                        .fillMaxWidth()
-                                        .clickable { showLocationDialog = true },
-                                    readOnly = true,
-                                    leadingIcon = { Icon(Icons.Default.LocationOn, contentDescription = "库位") },
-                                    trailingIcon = {
-                                        Row {
-                                            if (selectedLocation?.id == viewModel.getDefaultLocationId()) {
-                                                Icon(
-                                                    Icons.Default.Star,
-                                                    contentDescription = "默认库位",
-                                                    tint = MaterialTheme.colorScheme.primary,
-                                                    modifier = Modifier.size(20.dp)
+                                        .widthIn(min = 72.dp, max = 100.dp)
+                                        .height(36.dp),
+                                    decorationBox = { innerTextField ->
+                                        Row(
+                                            modifier = Modifier
+                                                .fillMaxSize()
+                                                .clip(MaterialTheme.shapes.small)
+                                                .border(
+                                                    1.dp,
+                                                    MaterialTheme.colorScheme.outline,
+                                                    MaterialTheme.shapes.small
                                                 )
-                                                Spacer(modifier = Modifier.width(4.dp))
-                                            }
-                                            IconButton(onClick = { showLocationDialog = true }) {
-                                                Icon(Icons.Default.ArrowDropDown, contentDescription = "选择库位")
+                                                .background(
+                                                    MaterialTheme.colorScheme.surface,
+                                                    MaterialTheme.shapes.small
+                                                )
+                                                .padding(horizontal = 8.dp),
+                                            verticalAlignment = Alignment.CenterVertically,
+                                            horizontalArrangement = Arrangement.Center
+                                        ) {
+                                            Text(
+                                                "¥",
+                                                style = MaterialTheme.typography.bodyMedium,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                                            )
+                                            Box(
+                                                modifier = Modifier.weight(1f),
+                                                contentAlignment = Alignment.Center
+                                            ) {
+                                                innerTextField()
                                             }
                                         }
-                                    },
-                                    isError = selectedLocation == null
+                                    }
+                                )
+                                Text(
+                                    text = if (deductionAmountDisplay.isNotEmpty()) deductionAmountDisplay else "0.00",
+                                    style = MaterialTheme.typography.titleMedium.copy(
+                                        fontWeight = FontWeight.Bold,
+                                        color = MaterialTheme.colorScheme.error
+                                    )
                                 )
                             }
 
-                            // 经手人选择
-                            Box(modifier = Modifier.fillMaxWidth()) {
-                                OutlinedTextField(
-                                    value = selectedOperator?.name ?: "请选择经手人",
-                                    onValueChange = {},
-                                    label = { Text("经手人") },
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .clickable { showOperatorDialog = true },
-                                    readOnly = true,
-                                    leadingIcon = { Icon(Icons.Default.PersonOutline, contentDescription = "经手人") },
-                                    trailingIcon = {
-                                        Row {
-                                            if (selectedOperator?.id == viewModel.getDefaultHandlerId()) {
-                                                Icon(
-                                                    Icons.Default.Star,
-                                                    contentDescription = "默认经手人",
-                                                    tint = MaterialTheme.colorScheme.primary,
-                                                    modifier = Modifier.size(20.dp)
-                                                )
-                                                Spacer(modifier = Modifier.width(4.dp))
-                                            }
-                                            IconButton(onClick = { showOperatorDialog = true }) {
-                                                Icon(Icons.Default.ArrowDropDown, contentDescription = "选择经手人")
-                                            }
-                                        }
-                                    },
-                                    isError = selectedOperator == null
-                                )
-                            }
-                        }
-                    }
-
-                    // 4. 备注信息卡片
-                    Card(modifier = Modifier.fillMaxWidth()) {
-                        Column(modifier = Modifier.padding(AppDimens.pagePadding)) {
-                            Text(
-                                text = "备注信息",
-                                style = MaterialTheme.typography.titleMedium,
-                                color = MaterialTheme.colorScheme.primary
-                            )
-                            Spacer(modifier = Modifier.height(8.dp))
-                            OutlinedTextField(
-                                value = remark,
-                                onValueChange = { viewModel.setRemark(it) },
-                                label = { Text("请输入备注信息（可选）") },
+                            Divider()
+                            Row(
                                 modifier = Modifier.fillMaxWidth(),
-                                maxLines = 3
+                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                FilterChip(
+                                    selected = includeShippingFeeRemark,
+                                    onClick = { viewModel.toggleFeeRemarkType(FeeRemarkType.SHIPPING) },
+                                    label = {
+                                        Text("运费", style = MaterialTheme.typography.labelMedium)
+                                    },
+                                    modifier = Modifier.height(28.dp)
+                                )
+                                FilterChip(
+                                    selected = includePackagingFeeRemark,
+                                    onClick = { viewModel.toggleFeeRemarkType(FeeRemarkType.PACKAGING) },
+                                    label = {
+                                        Text("包梨费", style = MaterialTheme.typography.labelMedium)
+                                    },
+                                    modifier = Modifier.height(28.dp)
+                                )
+                            }
+                            BasicTextField(
+                                value = remarkNote,
+                                onValueChange = { viewModel.setRemarkNote(it) },
+                                singleLine = true,
+                                textStyle = TextStyle(
+                                    fontSize = 14.sp,
+                                    color = MaterialTheme.colorScheme.onSurface
+                                ),
+                                cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(36.dp),
+                                decorationBox = { innerTextField ->
+                                    Box(
+                                        modifier = Modifier
+                                            .fillMaxSize()
+                                            .clip(MaterialTheme.shapes.small)
+                                            .border(
+                                                1.dp,
+                                                MaterialTheme.colorScheme.outline,
+                                                MaterialTheme.shapes.small
+                                            )
+                                            .padding(horizontal = 10.dp),
+                                        contentAlignment = Alignment.CenterStart
+                                    ) {
+                                        if (remarkNote.isEmpty()) {
+                                            Text(
+                                                "备注（可选）",
+                                                style = MaterialTheme.typography.bodyMedium,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                                            )
+                                        }
+                                        innerTextField()
+                                    }
+                                }
                             )
                         }
                     }
@@ -985,13 +1087,17 @@ fun InStockScreen(
                                     try {
                                         val result = viewModel.saveBill()
                                         if (result.isSuccess) {
-                                            val (billId, billNo) = result.getOrNull()!!
-                                            savedBillId = billId
-                                            savedBillNo = billNo
+                                            val saveResult = result.getOrNull()!!
+                                            savedBillId = saveResult.billId
+                                            savedBillNo = saveResult.billNo
+                                            savedDeduction = saveResult.deduction
+                                            deductionPrintDone = false
                                             pendingChoiceDialog = true
                                             showPrintDialog = true
-                                            // 仅打印日志，不触发实时同步，依赖TCP连接成功后自动同步
-                                            Log.d(TAG, "✅ 保存入库单成功，单号: $billNo，已标记为未同步状态，等待TCP连接后自动同步")
+                                            val deductionInfo = saveResult.deduction?.let {
+                                                "，扣款单已生成（¥${String.format("%.2f", it.amount)}）"
+                                            } ?: ""
+                                            Log.d(TAG, "✅ 保存入库单成功，单号: ${saveResult.billNo}$deductionInfo，等待TCP连接后自动同步")
                                         } else {
                                             val errorMsg = result.exceptionOrNull()?.message ?: "保存失败，原因未知"
                                             Toast.makeText(context, "保存失败：$errorMsg", Toast.LENGTH_SHORT).show()
@@ -1058,6 +1164,50 @@ fun InStockScreen(
                 }
             }
         }
+    }
+}
+
+// 扣款项目行：左侧标签，右侧输入框
+@Composable
+private fun DeductionFormRow(
+    label: String,
+    value: String,
+    onValueChange: (String) -> Unit,
+    modifier: Modifier = Modifier,
+    readOnly: Boolean = false,
+    prefix: String? = null,
+    keyboardOptions: KeyboardOptions = KeyboardOptions.Default
+) {
+    Row(
+        modifier = modifier
+            .fillMaxWidth()
+            .heightIn(min = 56.dp),
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(
+            text = label,
+            style = MaterialTheme.typography.bodyLarge.copy(
+                fontSize = 16.sp,
+                fontWeight = FontWeight.Medium
+            ),
+            modifier = Modifier.width(72.dp)
+        )
+        OutlinedTextField(
+            value = value,
+            onValueChange = onValueChange,
+            modifier = Modifier
+                .weight(1f)
+                .heightIn(min = 56.dp),
+            readOnly = readOnly,
+            singleLine = true,
+            textStyle = MaterialTheme.typography.titleMedium.copy(
+                fontSize = 18.sp,
+                fontWeight = FontWeight.Bold
+            ),
+            keyboardOptions = keyboardOptions,
+            prefix = prefix?.let { { Text(it, style = MaterialTheme.typography.titleMedium) } }
+        )
     }
 }
 

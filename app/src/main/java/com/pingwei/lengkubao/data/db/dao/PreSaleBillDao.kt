@@ -41,4 +41,25 @@ interface PreSaleBillDao {
         startTime: Long?,
         endTime: Long?
     ): Flow<List<PreSaleBill>>
+
+    @Query("SELECT * FROM presale_bill WHERE source_record_id = :sourceRecordId LIMIT 1")
+    suspend fun getBillBySourceRecordId(sourceRecordId: String): PreSaleBill?
+
+    @Query("SELECT * FROM presale_bill WHERE bill_no = :billNo LIMIT 1")
+    suspend fun getBillByBillNo(billNo: String): PreSaleBill?
+
+    @Query("UPDATE presale_bill SET source_record_id = :sourceRecordId, source_device_id = :sourceDeviceId WHERE id = :id")
+    suspend fun updateSourceIdentity(id: Long, sourceRecordId: String, sourceDeviceId: String)
+
+    @Query("UPDATE presale_bill SET remote_updated_at = :commitSeq WHERE id = :id")
+    suspend fun updateRemoteUpdatedAt(id: Long, commitSeq: Long)
+
+    @Query("UPDATE presale_bill SET sale_mode = :mode, status = :status WHERE id = :id")
+    suspend fun updateSaleModeAndStatus(id: Long, mode: String, status: String)
+
+    @Query("SELECT * FROM presale_bill WHERE sync_status = 0 ORDER BY create_time DESC")
+    suspend fun getUnsyncedBills(): List<PreSaleBill>
+
+    @Query("UPDATE presale_bill SET sync_status = 0 WHERE create_time BETWEEN :startTime AND :endTime")
+    suspend fun resetSyncStatusByCreateTimeRange(startTime: Long, endTime: Long): Int
 }

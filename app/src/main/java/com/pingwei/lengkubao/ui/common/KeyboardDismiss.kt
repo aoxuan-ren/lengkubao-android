@@ -6,11 +6,13 @@ import android.view.View
 import android.view.inputmethod.InputMethodManager
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
+import androidx.compose.ui.ExperimentalComposeUiApi
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.platform.LocalView
 
+@OptIn(ExperimentalComposeUiApi::class)
 @Composable
 fun rememberDismissKeyboard(): () -> Unit {
     val focusManager = LocalFocusManager.current
@@ -29,7 +31,19 @@ fun rememberDismissKeyboard(): () -> Unit {
     }
 }
 
+@Composable
+fun rememberRunWithKeyboardDismiss(): ((() -> Unit) -> Unit) {
+    val dismiss = rememberDismissKeyboard()
+    return remember(dismiss) {
+        { action ->
+            dismiss()
+            action()
+        }
+    }
+}
+
 /** 仅隐藏软键盘，不 clearFocus，适用于搜索框选中后收键盘。 */
+@OptIn(ExperimentalComposeUiApi::class)
 @Composable
 fun rememberHideKeyboardOnly(): () -> Unit {
     val keyboardController = LocalSoftwareKeyboardController.current

@@ -16,7 +16,10 @@ import androidx.room.PrimaryKey
             onDelete = ForeignKey.CASCADE
         )
     ],
-    indices = [Index(value = ["bill_id"])]
+    indices = [
+        Index(value = ["bill_id"]),
+        Index(value = ["source_record_id"], unique = true)
+    ]
 )
 data class PaymentRecord(
     @PrimaryKey(autoGenerate = true)
@@ -28,7 +31,7 @@ data class PaymentRecord(
     @ColumnInfo(name = "amount")
     val amount: Double,
 
-    /** 现金 / 转账 / 其他 */
+    /** 微信 / 转账 / 其他 */
     @ColumnInfo(name = "pay_method")
     val payMethod: String,
 
@@ -39,11 +42,17 @@ data class PaymentRecord(
     val remark: String = "",
 
     @ColumnInfo(name = "sync_status")
-    val syncStatus: Int = 0
+    val syncStatus: Int = 0,
+
+    @ColumnInfo(name = "source_record_id")
+    val sourceRecordId: String? = null,
+
+    @ColumnInfo(name = "source_device_id")
+    val sourceDeviceId: String? = null
 )
 
 object PayMethod {
-    const val CASH = "现金"
+    const val WECHAT = "微信"
     const val TRANSFER = "转账"
     const val OTHER = "其他"
 }

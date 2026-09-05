@@ -4,6 +4,7 @@ import android.content.Context
 import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import androidx.room.withTransaction
 import com.pingwei.lengkubao.LengKuBaoApplication
 import com.pingwei.lengkubao.data.db.AppDatabase
 import com.pingwei.lengkubao.data.db.entity.*
@@ -11,7 +12,6 @@ import com.pingwei.lengkubao.sync.TcpSyncManager
 import com.pingwei.lengkubao.ui.common.ConfigManager
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 import java.text.SimpleDateFormat
 import java.util.*
 
@@ -22,6 +22,17 @@ data class ProductInputItem(
     var unitPrice: Double = 0.0
 ) {
     fun calculateAmount(): Double = quantity * unitPrice
+}
+
+data class InStockSaveResult(
+    val billId: Long,
+    val billNo: String,
+    val deduction: Deduction? = null
+)
+
+enum class FeeRemarkType {
+    SHIPPING,
+    PACKAGING
 }
 
 class InStockViewModel(application: android.app.Application) : AndroidViewModel(application) {
@@ -52,10 +63,19 @@ class InStockViewModel(application: android.app.Application) : AndroidViewModel(
     private val _productInputs = MutableStateFlow<List<ProductInputItem>>(emptyList())
     val productInputs: StateFlow<List<ProductInputItem>> = _productInputs.asStateFlow()
 
-    private val _remark = MutableStateFlow("")
-    val remark: StateFlow<String> = _remark.asStateFlow()
+    private val _remarkNote = MutableStateFlow("")
+    val remarkNote: StateFlow<String> = _remarkNote.asStateFlow()
 
-    private val _isLoading = MutableStateFlow(false)
+    private val _includeShippingFeeRemark = MutableStateFlow(false)
+    val includeShippingFeeRemark: StateFlow<Boolean> = _includeShippingFeeRemark.asStateFlow()
+
+    private val _includePackagingFeeRemark = MutableStateFlow(false)
+    val includePackagingFeeRemark: StateFlow<Boolean> = _includePackagingFeeRemark.asStateFlow()
+
+    private val _deductionUnitPrice = MutableStateFlow("")
+    val deductionUnitPrice: StateFlow<String> = _deductionUnitPrice.asStateFlow()
+
+    private val _isLoading = MutableStateFlow(true)
     val isLoading: StateFlow<Boolean> = _isLoading.asStateFlow()
 
     // 默认值ID
@@ -66,29 +86,23 @@ class InStockViewModel(application: android.app.Application) : AndroidViewModel(
     private var cachedDefaultLocation: Location? = null
     private var cachedDefaultOperator: Operator? = null
 
-    // ===== 计算属性 =====
-    val totalAmount: StateFlow<Double>
-        get() = _productInputs.map { inputs ->
-            inputs.sumOf { it.calculateAmount() }
-        }.stateIn(
-            viewModelScope,
-            SharingStarted.WhileSubscribed(5000),
-            0.0
-        )
+    // ===== 计算属性（须为成员属性，不可用 getter，否则每次访问都会新建 StateFlow 导致数值跳动）=====
+    val totalAmount: StateFlow<Double> = _productInputs
+        .map { inputs -> inputs.sumOf { it.calculateAmount() } }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), 0.0)
 
-    val totalQuantity: StateFlow<Int>
-        get() = _productInputs.map { inputs ->
-            inputs.sumOf { it.quantity }
-        }.stateIn(
-            viewModelScope,
-            SharingStarted.WhileSubscribed(5000),
-            0
-        )
+    val totalQuantity: StateFlow<Int> = _productInputs
+        .map { inputs -> inputs.sumOf { it.quantity } }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), 0)
+
+    val deductionAmount: StateFlow<Double> = combine(_deductionUnitPrice, totalQuantity) { unitPriceText, quantity ->
+        parseDecimalInput(unitPriceText) * quantity
+    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), 0.0)
 
     // ===== 数据流 =====
     val allLocations = database.locationDao().getAllLocations()
     val allOperators = database.operatorDao().getAllOperators()
-    val allCustomers = database.customerDao().getAllCustomers()
+    val allCustomers = database.customerDao().getCustomersByType(CustomerType.SELLER)
 
     // ===== 初始化 =====
     init {
@@ -210,9 +224,49 @@ class InStockViewModel(application: android.app.Application) : AndroidViewModel(
     }
 
     // ===== 其他操作方法 =====
-    fun setRemark(text: String) {
-        _remark.value = text
-        Log.d(TAG, "ℹ️ 设置备注: $text")
+    fun setRemarkNote(text: String) {
+        _remarkNote.value = text
+    }
+
+    fun selectFeeRemarkType(type: FeeRemarkType?) {
+        _includeShippingFeeRemark.value = type == FeeRemarkType.SHIPPING
+        _includePackagingFeeRemark.value = type == FeeRemarkType.PACKAGING
+    }
+
+    fun toggleFeeRemarkType(type: FeeRemarkType) {
+        when (type) {
+            FeeRemarkType.SHIPPING -> {
+                selectFeeRemarkType(if (_includeShippingFeeRemark.value) null else FeeRemarkType.SHIPPING)
+            }
+            FeeRemarkType.PACKAGING -> {
+                selectFeeRemarkType(if (_includePackagingFeeRemark.value) null else FeeRemarkType.PACKAGING)
+            }
+        }
+    }
+
+    fun setDeductionUnitPrice(text: String) {
+        _deductionUnitPrice.value = text.filter { it.isDigit() || it == '.' }
+    }
+
+    fun calculateDeductionAmount(quantity: Int = currentTotalQuantity(), unitPriceText: String = _deductionUnitPrice.value): Double {
+        return quantity * parseDecimalInput(unitPriceText)
+    }
+
+    private fun currentTotalQuantity(): Int = _productInputs.value.sumOf { it.quantity }
+
+    private fun parseDecimalInput(text: String): Double {
+        val normalized = text.trim().replace('。', '.')
+        if (normalized.isEmpty() || normalized == ".") return 0.0
+        return normalized.toDoubleOrNull() ?: 0.0
+    }
+
+    private fun buildRemark(): String {
+        val parts = mutableListOf<String>()
+        if (_includeShippingFeeRemark.value) parts.add("运费")
+        if (_includePackagingFeeRemark.value) parts.add("包梨费")
+        val note = _remarkNote.value.trim()
+        if (note.isNotEmpty()) parts.add(note)
+        return parts.joinToString("；")
     }
 
     fun selectCustomer(customer: Customer?) {
@@ -244,8 +298,11 @@ class InStockViewModel(application: android.app.Application) : AndroidViewModel(
             }
             _productInputs.value = clearedInputs
 
-            // 清空备注
-            _remark.value = ""
+            // 清空备注与扣款
+            _remarkNote.value = ""
+            _includeShippingFeeRemark.value = false
+            _includePackagingFeeRemark.value = false
+            _deductionUnitPrice.value = ""
 
             // 使用缓存的默认值立即恢复库位和经手人，避免数据库查询延迟
             if (cachedDefaultLocation != null) {
@@ -267,8 +324,13 @@ class InStockViewModel(application: android.app.Application) : AndroidViewModel(
         }
     }
 
+    fun hasDeductionInput(): Boolean {
+        val unitPrice = parseDecimalInput(_deductionUnitPrice.value)
+        return unitPrice > 0 && currentTotalQuantity() > 0
+    }
+
     // ===== 保存入库单 =====
-    suspend fun saveBill(): Result<Pair<Long, String>> {
+    suspend fun saveBill(): Result<InStockSaveResult> {
         return try {
             // 1. 验证必填项
             val validationError = when {
@@ -290,6 +352,11 @@ class InStockViewModel(application: android.app.Application) : AndroidViewModel(
             val location = _selectedLocation.value!!
             val operator = _selectedOperator.value!!
 
+            val finalRemark = buildRemark()
+            val deductionQty = currentTotalQuantity()
+            val unitPrice = parseDecimalInput(_deductionUnitPrice.value)
+            val deductionAmt = deductionQty * unitPrice
+
             // 3. 创建入库单主表，新增syncStatus=0标记为未同步
             val bill = InStockBill(
                 billNo = billNo,
@@ -301,25 +368,17 @@ class InStockViewModel(application: android.app.Application) : AndroidViewModel(
                 operatorName = operator.name,
                 totalAmount = totalAmount.value,
                 totalQuantity = totalQuantity.value,
-                remark = _remark.value,
+                remark = finalRemark,
                 createTime = now,
                 status = "COMPLETED",
                 syncStatus = 0 // 0=未同步，1=已同步，标记单据待同步
             )
 
-            // 4. 保存主表并校验ID
-            val billId = database.inStockBillDao().insert(bill)
-            if (billId <= 0) {
-                Log.e(TAG, "❌ 入库单主表保存失败，返回ID: $billId")
-                return Result.failure(Exception("入库单保存失败，数据库返回无效ID"))
-            }
-
-            // 5. 保存入库单明细
             val items = _productInputs.value
                 .filter { it.quantity > 0 }
                 .map { inputItem ->
                     InStockItem(
-                        billId = billId,
+                        billId = 0,
                         productId = inputItem.product.id,
                         productNo = inputItem.product.productNo,
                         productName = inputItem.product.productName,
@@ -329,18 +388,67 @@ class InStockViewModel(application: android.app.Application) : AndroidViewModel(
                         unit = inputItem.product.unit
                     )
                 }
-            if (items.isNotEmpty()) {
-                database.inStockItemDao().insertAll(items)
-                Log.d(TAG, "✅ 保存了 ${items.size} 条入库单明细")
-            } else {
-                Log.w(TAG, "⚠️ 无有效商品明细，跳过明细保存")
+
+            var savedDeduction: Deduction? = null
+            var insertedBillId = 0L
+
+            database.withTransaction {
+                // 4. 保存主表并校验ID
+                insertedBillId = database.inStockBillDao().insert(bill)
+                if (insertedBillId <= 0) {
+                    throw IllegalStateException("入库单保存失败，数据库返回无效ID")
+                }
+
+                // 5. 保存入库单明细
+                val itemsWithBillId = items.map { it.copy(billId = insertedBillId) }
+                if (itemsWithBillId.isNotEmpty()) {
+                    database.inStockItemDao().insertAll(itemsWithBillId)
+                    Log.d(TAG, "✅ 保存了 ${itemsWithBillId.size} 条入库单明细")
+                } else {
+                    Log.w(TAG, "⚠️ 无有效商品明细，跳过明细保存")
+                }
+
+                // 6. 更新总库存（供预售出库）
+                updateStockInTransaction(
+                    items = itemsWithBillId,
+                    locationId = location.id,
+                    billNo = billNo,
+                    timestamp = now
+                )
+
+                // 7. 选填扣款：按入库总计数量 × 单价生成扣款记录（与预支扣款界面共用 deductions 表）
+                if (unitPrice > 0 && deductionQty > 0 && deductionAmt > 0) {
+                    val deduction = Deduction(
+                        customerNo = customer.customerNo,
+                        customerName = customer.customerName,
+                        amount = deductionAmt,
+                        quantity = deductionQty,
+                        unitPrice = unitPrice,
+                        deductDate = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).format(Date(now)),
+                        reason = finalRemark,
+                        handler = operator.name,
+                        creator = operator.name,
+                        status = 1,
+                        createTime = now,
+                        syncStatus = 0,
+                        operatorId = operator.id,
+                        operatorName = operator.name
+                    )
+                    val deductionId = database.deductionDao().insert(deduction)
+                    deduction.id = deductionId
+                    savedDeduction = deduction
+                    Log.d(TAG, "✅ 入库关联扣款已保存: ID=$deductionId, 数量=$deductionQty, 单价=$unitPrice, 金额=$deductionAmt")
+                }
             }
 
-            // 6. 更新库存
-            updateStock(items, location.id, billNo, now)
-
-            Log.d(TAG, "✅ 入库单本地保存成功: 单号=$billNo，ID=$billId，标记为未同步状态")
-            Result.success(Pair(billId, billNo))
+            Log.d(TAG, "✅ 入库单本地保存成功: 单号=$billNo，ID=$insertedBillId，标记为未同步状态")
+            Result.success(
+                InStockSaveResult(
+                    billId = insertedBillId,
+                    billNo = billNo,
+                    deduction = savedDeduction
+                )
+            )
         } catch (e: Exception) {
             Log.e(TAG, "❌ 入库单保存异常", e)
             Result.failure(e)
@@ -355,8 +463,8 @@ class InStockViewModel(application: android.app.Application) : AndroidViewModel(
         return "RK$dateStr${String.format("%04d", sequence)}"
     }
 
-    // 更新库存 - 新增/累加库存
-    private suspend fun updateStock(
+    // 更新总库存 - 新增/累加库存（须在 withTransaction 内调用）
+    private suspend fun updateStockInTransaction(
         items: List<InStockItem>,
         locationId: Long,
         billNo: String,
@@ -366,7 +474,6 @@ class InStockViewModel(application: android.app.Application) : AndroidViewModel(
             items.forEach { item ->
                 val existingStock = database.stockDao().getStock(item.productId, locationId)
                 if (existingStock != null) {
-                    // 已有库存，累加数量
                     database.stockDao().addStockQuantity(
                         productId = item.productId,
                         locationId = locationId,
@@ -374,9 +481,8 @@ class InStockViewModel(application: android.app.Application) : AndroidViewModel(
                         timestamp = timestamp,
                         billNo = billNo
                     )
-                    Log.d(TAG, "✅ 累加商品ID ${item.productId} 库存，数量+${item.quantity}")
+                    Log.d(TAG, "✅ 累加商品ID ${item.productId} 总库存，数量+${item.quantity}")
                 } else {
-                    // 无库存，创建新记录
                     val product = database.productDao().getByNo(item.productNo)
                     val location = database.locationDao().getLocationById(locationId)
                     if (product != null && location != null) {
@@ -385,16 +491,15 @@ class InStockViewModel(application: android.app.Application) : AndroidViewModel(
                             productNo = product.productNo,
                             productName = product.productName,
                             locationId = locationId,
-                            locationNo = location.locationNo,
                             currentQuantity = item.quantity,
                             reservedQuantity = 0,
                             lastUpdated = timestamp,
                             lastBillNo = billNo
                         )
                         database.stockDao().insert(newStock)
-                        Log.d(TAG, "✅ 为商品ID ${item.productId} 创建新库存记录，数量${item.quantity}")
+                        Log.d(TAG, "✅ 为商品ID ${item.productId} 创建新总库存记录，数量${item.quantity}")
                     } else {
-                        Log.w(TAG, "⚠️ 更新库存失败，商品/库位不存在：商品ID=${item.productId}，库位ID=$locationId")
+                        Log.w(TAG, "⚠️ 更新总库存失败，商品/库位不存在：商品ID=${item.productId}，库位ID=$locationId")
                     }
                 }
             }

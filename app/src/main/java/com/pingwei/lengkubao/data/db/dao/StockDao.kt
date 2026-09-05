@@ -32,12 +32,13 @@ interface StockDao {
             s.product_no as productNo,
             s.product_name as productName,
             s.location_id as locationId,
-            s.location_no as locationNo,
+            l.location_name as locationName,
             s.current_quantity as currentQuantity,
             s.reserved_quantity as reservedQuantity,
             s.last_updated as lastUpdated,
             s.last_bill_no as lastBillNo
         FROM stock s
+        INNER JOIN location l ON s.location_id = l.id
         WHERE s.location_id = :locationId
         AND s.current_quantity > 0
         ORDER BY s.product_no
@@ -54,12 +55,13 @@ interface StockDao {
             s.product_no as productNo,
             s.product_name as productName,
             s.location_id as locationId,
-            s.location_no as locationNo,
+            l.location_name as locationName,
             s.current_quantity as currentQuantity,
             s.reserved_quantity as reservedQuantity,
             s.last_updated as lastUpdated,
             s.last_bill_no as lastBillNo
         FROM stock s
+        INNER JOIN location l ON s.location_id = l.id
         WHERE s.location_id = :locationId
         AND s.product_id = :productId
     """)
@@ -193,7 +195,7 @@ interface StockDao {
     fun getStocksByProduct(productId: Long): Flow<List<Stock>>
 
     // 获取所有库存
-    @Query("SELECT * FROM stock ORDER BY location_no, product_no")
+    @Query("SELECT * FROM stock ORDER BY location_id, product_no")
     fun getAllStocks(): Flow<List<Stock>>
 
     // 检查可用库存数量

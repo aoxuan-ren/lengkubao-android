@@ -8,7 +8,8 @@ import kotlinx.coroutines.flow.Flow
 
 @Dao
 interface PackagingBillDao {
-    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    /** 单号冲突必须失败（不可 REPLACE），由开单逻辑重试生成新号。 */
+    @Insert(onConflict = OnConflictStrategy.ABORT)
     suspend fun insert(bill: PackagingBill): Long
 
     @Query("SELECT * FROM packaging_bill WHERE id = :id")
@@ -56,6 +57,10 @@ interface PackagingBillDao {
     @Query("UPDATE packaging_bill SET is_synced = 0, sync_status = 0 WHERE create_time BETWEEN :startTime AND :endTime")
     suspend fun resetSyncStatusByCreateTimeRange(startTime: Long, endTime: Long): Int
 
-    @Query("SELECT COUNT(*) FROM packaging_bill WHERE DATE(create_time/1000, 'unixepoch') = DATE(:date/1000, 'unixepoch')")
-    suspend fun getTodayBillCount(date: Long): Int
+    /**
+     * 按单号前缀取当日已用流水相关单号（含历史迁移产生的 bill_no_id 后缀）。
+     * 流水号由调用方解析前缀后的数字部分取 max，避免 COUNT/时区导致复用旧号。
+     */
+    @Query("SELECT bill_no FROM packaging_bill WHERE bill_no LIKE :prefix || '%'")
+    suspend fun getBillNosWithPrefix(prefix: String): List<String>
 }

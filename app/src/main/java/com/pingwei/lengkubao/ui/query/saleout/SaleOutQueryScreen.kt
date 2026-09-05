@@ -88,7 +88,7 @@ fun SaleOutQueryScreen(
 
                                 // 显示同步结果提示
                                 val message = if (isSuccess) "同步成功" else "同步失败"
-                                Toast.makeText(context, "销售单($billId) $message", Toast.LENGTH_SHORT).show()
+                                Toast.makeText(context, "报账单($billId) $message", Toast.LENGTH_SHORT).show()
                             }
                         }
                     }
@@ -169,7 +169,7 @@ fun SaleOutQueryScreen(
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("销售单查询") },
+                title = { Text("报账单查询") },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
                         Icon(Icons.Default.ArrowBack, contentDescription = "返回")
@@ -218,7 +218,10 @@ fun SaleOutQueryScreen(
             // 通用筛选栏（复用QueryFilterBar，与入库/包装单风格一致）
             QueryFilterBar(
                 searchText = searchText,
-                onSearchTextChange = { searchText = it },
+                onSearchTextChange = {
+                    searchText = it
+                    viewModel.updateKeyword(it)
+                },
                 onSearch = {
                     launchUiTask("条件搜索") {
                         viewModel.search(
@@ -265,7 +268,7 @@ fun SaleOutQueryScreen(
                             )
                             Spacer(modifier = Modifier.height(16.dp))
                             Text(
-                                text = "暂无销售单数据",
+                                text = "暂无报账单数据",
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
                         }

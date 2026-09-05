@@ -19,6 +19,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.pingwei.lengkubao.LengKuBaoApplication
 import com.pingwei.lengkubao.data.db.entity.Customer
+import com.pingwei.lengkubao.utils.SyncTrigger
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -117,6 +118,7 @@ fun CustomerEditScreen(
                 withContext(Dispatchers.Main) {
                     isSaving = false
                     if (result > 0) {
+                        SyncTrigger.triggerCustomerSync(context, updatedCustomer.id)
                         Toast.makeText(context, "客户信息已更新", Toast.LENGTH_SHORT).show()
                         onBackPressed()
                     } else {

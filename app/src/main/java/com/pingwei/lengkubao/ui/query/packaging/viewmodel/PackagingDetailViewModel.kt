@@ -9,6 +9,7 @@ import com.pingwei.lengkubao.data.db.entity.PackagingBill
 import com.pingwei.lengkubao.data.db.entity.PackagingItem
 import com.pingwei.lengkubao.service.PackagingVoidService
 import com.pingwei.lengkubao.service.StockService
+import com.pingwei.lengkubao.utils.PackagingSyncHelper
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -36,6 +37,9 @@ class PackagingDetailViewModel(application: Application) : AndroidViewModel(appl
     private val _isLoading = MutableStateFlow(false)
     val isLoading: StateFlow<Boolean> = _isLoading.asStateFlow()
 
+    private val _isResetSyncing = MutableStateFlow(false)
+    val isResetSyncing: StateFlow<Boolean> = _isResetSyncing.asStateFlow()
+
     // 新增：操作结果状态
     private val _operationResult = MutableStateFlow<OperationResult?>(null)
     val operationResult: StateFlow<OperationResult?> = _operationResult.asStateFlow()
@@ -56,8 +60,8 @@ class PackagingDetailViewModel(application: Application) : AndroidViewModel(appl
         this.onDeleteSuccessCallback = callback
     }
 
-    fun loadBill(billId: Long) {
-        if (billId == currentBillId && _bill.value != null) return
+    fun loadBill(billId: Long, force: Boolean = false) {
+        if (!force && billId == currentBillId && _bill.value != null) return
 
         currentBillId = billId
         viewModelScope.launch {
@@ -151,21 +155,47 @@ class PackagingDetailViewModel(application: Application) : AndroidViewModel(appl
         }
     }
 
-    /**
-     * 新增：打印方法（如果原来没有的话）
-     */
-    suspend fun printBill(): Boolean {
+    suspend fun markPrinted(): Boolean {
         return try {
             val currentBill = _bill.value ?: return false
             database.packagingBillDao().updatePrintStatus(currentBill.id, true)
-            loadBill(currentBill.id) // 重新加载更新状态
-            _operationResult.value = OperationResult.Success("打印状态已更新", needRefresh = true)
+            database.packagingBillDao().update(
+                currentBill.copy(
+                    printTime = System.currentTimeMillis(),
+                    isPrinted = true
+                )
+            )
+            loadBill(currentBill.id)
             true
         } catch (e: Exception) {
             Log.e(TAG, "❌ 更新打印状态失败", e)
-            _operationResult.value = OperationResult.Error("更新打印状态失败: ${e.message}")
             false
         }
+    }
+
+    /**
+     * 重置同步状态并重新上传到电脑端。
+     */
+    fun requestResetAndSync() {
+        val currentBill = _bill.value ?: run {
+            _operationResult.value = OperationResult.Error("单据未加载")
+            return
+        }
+        if (currentBill.isVoided) {
+            _operationResult.value = OperationResult.Error("作废单不能同步")
+            return
+        }
+        if (currentBillId <= 0) return
+
+        viewModelScope.launch {
+            _bill.value = currentBill.copy(isSynced = false)
+            _isResetSyncing.value = true
+            PackagingSyncHelper.resetAndSyncBillAsync(getApplication(), currentBillId)
+        }
+    }
+
+    fun onResetSyncComplete() {
+        _isResetSyncing.value = false
     }
 
     /**

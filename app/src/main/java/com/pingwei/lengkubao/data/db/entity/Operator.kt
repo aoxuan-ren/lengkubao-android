@@ -9,28 +9,24 @@ data class Operator(
     @PrimaryKey(autoGenerate = true)
     val id: Long = 0,
 
-    @ColumnInfo(name = "operatorNo")
-    val operatorNo: String, // 经手人编号
-
     @ColumnInfo(name = "name")
-    val name: String, // 经手人姓名
+    val name: String,
 
     @ColumnInfo(name = "phone")
-    val phone: String = "", // 联系电话
+    val phone: String = "",
 
     @ColumnInfo(name = "role")
-    val role: String = "操作员", // 角色
+    val role: String = "操作员",
 
     @ColumnInfo(name = "enabled")
-    val enabled: Boolean = true, // 是否启用
+    val enabled: Boolean = true,
 
     @ColumnInfo(name = "remark")
-    val remark: String = "", // 备注
+    val remark: String = "",
 
     @ColumnInfo(name = "create_time")
     val createTime: Long = System.currentTimeMillis(),
 
-    /** 同步状态：0-未同步，1-已同步，默认为0 */
     @ColumnInfo(name = "sync_status", defaultValue = "0")
-    val syncStatus: Int = 0
+    val syncStatus: Int = 0,
 )

@@ -2,14 +2,18 @@ package com.pingwei.lengkubao.data.db.entity
 
 import androidx.room.ColumnInfo
 import androidx.room.Entity
+import androidx.room.Index
 import androidx.room.PrimaryKey
 
-@Entity(tableName = "packaging_bill")
+@Entity(
+    tableName = "packaging_bill",
+    indices = [Index(value = ["bill_no"], unique = true)],
+)
 data class PackagingBill(
     @PrimaryKey(autoGenerate = true)
     val id: Long = 0,
 
-    @ColumnInfo(name = "bill_no", index = true)
+    @ColumnInfo(name = "bill_no")
     val billNo: String,
 
     @ColumnInfo(name = "customer_id")
@@ -24,9 +28,9 @@ data class PackagingBill(
     @ColumnInfo(name = "bill_date")
     val billDate: String,
 
-    // 新增：包装类型标记（取包装/退包装）
+    // 新增：包装类型标记（出包装/进包装）
     @ColumnInfo(name = "packaging_type_flag")
-    val packagingTypeFlag: String = "TAKE", // TAKE-取包装, RETURN-退包装
+    val packagingTypeFlag: String = "TAKE", // TAKE-出包装, RETURN-进包装
 
     @ColumnInfo(name = "operator_id")
     val operatorId: Long,

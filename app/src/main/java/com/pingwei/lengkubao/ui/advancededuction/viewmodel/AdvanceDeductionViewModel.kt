@@ -6,6 +6,7 @@ import androidx.lifecycle.viewModelScope
 import com.pingwei.lengkubao.data.db.AppDatabase
 import com.pingwei.lengkubao.data.db.entity.Advance
 import com.pingwei.lengkubao.data.db.entity.Customer
+import com.pingwei.lengkubao.data.db.entity.CustomerType
 import com.pingwei.lengkubao.data.db.entity.Deduction
 import com.pingwei.lengkubao.data.db.entity.Operator
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -36,6 +37,10 @@ class AdvanceDeductionViewModel(application: Application) : AndroidViewModel(app
     private val _isLoading = MutableStateFlow(false)
     val isLoading: StateFlow<Boolean> = _isLoading
 
+    // 最近保存的扣款记录（用于打印）
+    private val _lastSavedDeduction = MutableStateFlow<Deduction?>(null)
+    val lastSavedDeduction: StateFlow<Deduction?> = _lastSavedDeduction
+
     // 选中的客户
     private val _selectedCustomer = MutableStateFlow<Customer?>(null)
     val selectedCustomer: StateFlow<Customer?> = _selectedCustomer
@@ -56,7 +61,7 @@ class AdvanceDeductionViewModel(application: Application) : AndroidViewModel(app
     }
     private fun loadCustomers() {
         viewModelScope.launch {
-            database.customerDao().getAllCustomers().collect { list ->
+            database.customerDao().getCustomersByType(CustomerType.SELLER).collect { list ->
                 _allCustomers.value = list
             }
         }
@@ -141,15 +146,16 @@ class AdvanceDeductionViewModel(application: Application) : AndroidViewModel(app
         }
     }
 
-    // 修改 addDeduction 方法
     fun addDeduction(
         customerNo: String,
         customerName: String,
+        quantity: Int,
+        unitPrice: Double,
         amount: Double,
         reason: String,
         handler: String,
         creator: String,
-        operatorId: Long  // 新增参数
+        operatorId: Long
     ) {
         viewModelScope.launch {
             _isLoading.value = true
@@ -158,6 +164,8 @@ class AdvanceDeductionViewModel(application: Application) : AndroidViewModel(app
                     customerNo = customerNo,
                     customerName = customerName,
                     amount = amount,
+                    quantity = quantity,
+                    unitPrice = unitPrice,
                     deductDate = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).format(Date()),
                     reason = reason.ifEmpty { null },
                     handler = handler,
@@ -165,9 +173,11 @@ class AdvanceDeductionViewModel(application: Application) : AndroidViewModel(app
                     status = 1,
                     createTime = System.currentTimeMillis(),
                     syncStatus = 0,
-                    operatorId = operatorId  // 新增
+                    operatorId = operatorId
                 )
-                database.deductionDao().insert(deduction)
+                val id = database.deductionDao().insert(deduction)
+                deduction.id = id
+                _lastSavedDeduction.value = deduction
                 loadCustomerDeductions(customerNo)
             } catch (e: Exception) {
                 e.printStackTrace()
@@ -175,6 +185,10 @@ class AdvanceDeductionViewModel(application: Application) : AndroidViewModel(app
                 _isLoading.value = false
             }
         }
+    }
+
+    fun clearLastSavedDeduction() {
+        _lastSavedDeduction.value = null
     }
 
     fun deleteAdvance(advance: Advance) {

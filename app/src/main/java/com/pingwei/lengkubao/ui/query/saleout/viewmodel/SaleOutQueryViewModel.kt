@@ -38,6 +38,7 @@ class SaleOutQueryViewModel(application: Application) : AndroidViewModel(applica
         operatorId = null,
         locationId = null
     )
+    private var allBills = emptyList<SaleBill>()
 
     val savedTimeRangeLabel: String = defaultTimeRangeLabel
 
@@ -46,10 +47,19 @@ class SaleOutQueryViewModel(application: Application) : AndroidViewModel(applica
         observeDatabaseChanges()
     }
 
+    /** 输入时即时按单据号/客户/首字母过滤，不触发加载态 */
+    fun updateKeyword(keyword: String?) {
+        currentSearchParams = currentSearchParams.copy(
+            keyword = keyword?.takeIf { it.isNotBlank() }
+        )
+        _bills.value = filterBillsByParams(allBills, currentSearchParams)
+    }
+
     private fun observeDatabaseChanges() {
         viewModelScope.launch {
             database.saleBillDao().getAllBills().collect { billList ->
                 Log.d(TAG, "📊 数据库数据变化，收到 ${billList.size} 条销售单记录")
+                allBills = billList
                 _bills.value = filterBillsByParams(billList, currentSearchParams)
             }
         }
@@ -120,17 +130,8 @@ class SaleOutQueryViewModel(application: Application) : AndroidViewModel(applica
 
         Log.d(TAG, "搜索条件：keyword=$keyword, startTime=$startTime, endTime=$endTime")
 
-        val billList = database.saleBillDao()
-            .getSaleBillsByFilter(
-                billNo = null,
-                customerName = null,
-                startTime = startTime.takeIf { it != 0L },
-                endTime = endTime.takeIf { it != Long.MAX_VALUE },
-                operatorId = operatorId,
-                locationId = locationId
-            )
-            .first()
-
+        val billList = database.saleBillDao().getAllBills().first()
+        allBills = billList
         val filteredBills = filterBillsByParams(billList, currentSearchParams)
         Log.d(TAG, "🎯 搜索到 ${filteredBills.size} 张销售单")
         _bills.value = filteredBills
@@ -142,13 +143,15 @@ class SaleOutQueryViewModel(application: Application) : AndroidViewModel(applica
     ): List<SaleBill> {
         return billList.filter { bill ->
             val timeMatch = bill.createTime in params.startTime..params.endTime
+            val operatorMatch = params.operatorId == null || bill.operatorId == params.operatorId
+            val locationMatch = params.locationId == null || bill.locationId == params.locationId
             val keywordMatch = BillQuerySearchFilter.matches(
                 keyword = params.keyword,
                 billNo = bill.billNo,
                 customerNo = bill.customerNo,
                 customerName = bill.customerName
             )
-            timeMatch && keywordMatch
+            timeMatch && operatorMatch && locationMatch && keywordMatch
         }
     }
 

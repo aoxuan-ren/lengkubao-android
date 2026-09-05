@@ -8,6 +8,8 @@ import androidx.lifecycle.viewModelScope
 // 正确导入路径（统一使用该路径，删除原有其他路径的导入）
 import com.pingwei.lengkubao.service.model.InStockItemPrint
 import com.pingwei.lengkubao.service.model.PackagingItemPrint
+import com.pingwei.lengkubao.service.model.PreSaleItemPrint
+import com.pingwei.lengkubao.service.model.SaleItemPrint
 import com.pingwei.lengkubao.service.SunmiPrintService
 import com.pingwei.lengkubao.service.model.BillType
 import com.pingwei.lengkubao.service.model.PrintResult
@@ -292,6 +294,128 @@ class SaleBillPrinter(context: Context) : ViewModel() {
                     message = "打印异常: ${e.message}",
                     billNo = billNo,
                     billType = BillType.PACKAGING
+                )
+
+                val history = _printHistory.value.toMutableList()
+                history.add(0, result)
+                _printHistory.value = history
+
+                _printStatus.value = PrintStatus.Error("打印异常: ${e.message}")
+            }
+        }
+    }
+
+    /**
+     * 打印预售/出库销售单
+     */
+    fun printPreSaleBill(
+        billNo: String,
+        buyerName: String,
+        locationName: String,
+        operatorName: String,
+        saleMode: String,
+        items: List<PreSaleItemPrint>,
+        totalAmount: Double,
+        paidAmount: Double,
+        remark: String = "",
+    ) {
+        viewModelScope.launch {
+            _printStatus.value = PrintStatus.Printing
+            try {
+                val success = printService.printPreSaleBill(
+                    billNo = billNo,
+                    buyerName = buyerName,
+                    locationName = locationName,
+                    operatorName = operatorName,
+                    saleMode = saleMode,
+                    items = items,
+                    totalAmount = totalAmount,
+                    paidAmount = paidAmount,
+                    remark = remark,
+                )
+
+                val result = PrintResult(
+                    success = success,
+                    message = if (success) "打印成功" else "打印失败",
+                    billNo = billNo,
+                    billType = BillType.PRESALE,
+                )
+
+                val history = _printHistory.value.toMutableList()
+                history.add(0, result)
+                _printHistory.value = history
+
+                if (success) {
+                    _printStatus.value = PrintStatus.Success
+                } else {
+                    _printStatus.value = PrintStatus.Error("打印失败，请检查打印机状态")
+                }
+            } catch (e: Exception) {
+                val result = PrintResult(
+                    success = false,
+                    message = "打印异常: ${e.message}",
+                    billNo = billNo,
+                    billType = BillType.PRESALE,
+                )
+
+                val history = _printHistory.value.toMutableList()
+                history.add(0, result)
+                _printHistory.value = history
+
+                _printStatus.value = PrintStatus.Error("打印异常: ${e.message}")
+            }
+        }
+    }
+
+    /**
+     * 打印报账单（销售出库单）
+     */
+    fun printSaleBill(
+        billNo: String,
+        customerName: String,
+        locationName: String,
+        operatorName: String,
+        items: List<SaleItemPrint>,
+        totalAmount: Double,
+        totalQuantity: Int,
+        remark: String = "",
+    ) {
+        viewModelScope.launch {
+            _printStatus.value = PrintStatus.Printing
+            try {
+                val success = printService.printSaleBill(
+                    billNo = billNo,
+                    customerName = customerName,
+                    locationName = locationName,
+                    operatorName = operatorName,
+                    items = items,
+                    totalAmount = totalAmount,
+                    totalQuantity = totalQuantity,
+                    remark = remark,
+                )
+
+                val result = PrintResult(
+                    success = success,
+                    message = if (success) "打印成功" else "打印失败",
+                    billNo = billNo,
+                    billType = BillType.SALE,
+                )
+
+                val history = _printHistory.value.toMutableList()
+                history.add(0, result)
+                _printHistory.value = history
+
+                if (success) {
+                    _printStatus.value = PrintStatus.Success
+                } else {
+                    _printStatus.value = PrintStatus.Error("打印失败，请检查打印机状态")
+                }
+            } catch (e: Exception) {
+                val result = PrintResult(
+                    success = false,
+                    message = "打印异常: ${e.message}",
+                    billNo = billNo,
+                    billType = BillType.SALE,
                 )
 
                 val history = _printHistory.value.toMutableList()

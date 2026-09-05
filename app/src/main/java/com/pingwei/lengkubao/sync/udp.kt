@@ -45,6 +45,130 @@ class UdpDeviceDiscovery private constructor(private val context: Context) {
 
     private var broadcastSocket: DatagramSocket? = null
 
+    private fun getSubnetBroadcastAddresses(): List<InetAddress> {
+        val targets = linkedSetOf<InetAddress>()
+        try {
+            val interfaces = NetworkInterface.getNetworkInterfaces()
+            while (interfaces.hasMoreElements()) {
+                val intf = interfaces.nextElement()
+                if (!intf.isUp || intf.isLoopback) continue
+                for (addr in intf.interfaceAddresses) {
+                    addr.broadcast?.let { targets.add(it) }
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "⚠️ 获取子网广播地址失败: ${e.message}")
+        }
+        if (targets.isEmpty()) {
+            targets.add(InetAddress.getByName("255.255.255.255"))
+        }
+        return targets.toList()
+    }
+
+    private fun parseServerUdpMessage(
+        response: String,
+        serverIp: String,
+        pairingCode: String?
+    ): DiscoveredDevice? {
+        val parts = response.split("|")
+        if (parts.isEmpty() || parts.size < 4) return null
+        val isResponse = parts[0] == Constant.UDP_MSG_RESPONSE
+        val isAnnounce = parts[0] == Constant.UDP_MSG_SERVER_ANNOUNCE
+        if (!isResponse && !isAnnounce) return null
+
+        val serverName = parts[1]
+        val serverPairingCode = parts[2]
+        val serverPort = parts[3].toIntOrNull() ?: 8080
+        if (!pairingCode.isNullOrBlank() && serverPairingCode != pairingCode) return null
+
+        return DiscoveredDevice(
+            deviceName = serverName,
+            ip = serverIp,
+            port = serverPort,
+            pairingCode = serverPairingCode
+        )
+    }
+
+    /**
+     * 同步 UDP 发现（主动请求 + 被动接收广播）
+     */
+    suspend fun discoverServers(
+        pairingCode: String? = null,
+        timeoutMs: Long = Constant.UDP_BROADCAST_TIMEOUT
+    ): List<DiscoveredDevice> {
+        return withContext(Dispatchers.IO) {
+            val foundDevices = mutableListOf<DiscoveredDevice>()
+            var socket: DatagramSocket? = null
+            try {
+                socket = DatagramSocket(null).apply {
+                    reuseAddress = true
+                    bind(InetSocketAddress(0))
+                    broadcast = true
+                    soTimeout = 500
+                }
+
+                val deviceId = getDeviceId()
+                val deviceName = getDeviceName()
+                val discoverMsg = if (pairingCode.isNullOrBlank()) {
+                    "DISCOVER_LENGKUBAO|$deviceId|$deviceName"
+                } else {
+                    "DISCOVER_LENGKUBAO|$deviceId|$deviceName|$pairingCode"
+                }
+                val sendData = discoverMsg.toByteArray(Charsets.UTF_8)
+                val broadcastTargets = getSubnetBroadcastAddresses()
+                Log.i(TAG, "🔍 UDP发现: 向 ${broadcastTargets.size} 个子网发送请求")
+
+                repeat(3) { round ->
+                    for (target in broadcastTargets) {
+                        try {
+                            val packet = DatagramPacket(
+                                sendData,
+                                sendData.size,
+                                target,
+                                Constant.UDP_BROADCAST_PORT
+                            )
+                            socket.send(packet)
+                            Log.d(TAG, "📤 发送UDP广播(${round + 1}/3): $discoverMsg -> ${target.hostAddress}")
+                        } catch (e: Exception) {
+                            Log.w(TAG, "⚠️ 发送UDP到 ${target.hostAddress} 失败: ${e.message}")
+                        }
+                    }
+                    delay(250)
+                }
+
+                val responseBuffer = ByteArray(1024)
+                val deadline = System.currentTimeMillis() + timeoutMs
+                while (System.currentTimeMillis() < deadline) {
+                    try {
+                        val receivePacket = DatagramPacket(responseBuffer, responseBuffer.size)
+                        socket.receive(receivePacket)
+                        val response = String(receivePacket.data, 0, receivePacket.length, Charsets.UTF_8)
+                        val serverIp = receivePacket.address?.hostAddress ?: continue
+                        Log.d(TAG, "📥 收到UDP: $response 来自 $serverIp")
+
+                        val device = parseServerUdpMessage(response, serverIp, pairingCode) ?: continue
+                        if (foundDevices.none { it.ip == device.ip }) {
+                            foundDevices.add(device)
+                            Log.i(TAG, "✅ 发现服务器: ${device.deviceName} (${device.ip}:${device.port})")
+                            sendDeviceFoundBroadcast(device)
+                        }
+                    } catch (_: SocketTimeoutException) {
+                        // 继续等待
+                    }
+                }
+                foundDevices
+            } catch (e: Exception) {
+                Log.e(TAG, "❌ UDP发现异常: ${e.message}", e)
+                emptyList()
+            } finally {
+                try {
+                    socket?.close()
+                } catch (_: Exception) {
+                }
+            }
+        }
+    }
+
     /**
      * 开始UDP广播发现服务器
      */
@@ -63,94 +187,19 @@ class UdpDeviceDiscovery private constructor(private val context: Context) {
             Log.i(TAG, "🔍 开始UDP广播扫描，配对码: ${pairingCode ?: "任意"}")
 
             try {
-                // 创建UDP广播Socket
-                broadcastSocket = DatagramSocket().apply {
-                    broadcast = true
-                    soTimeout = Constant.UDP_BROADCAST_TIMEOUT.toInt()
-                }
-
-                // 发送发现广播
-                val deviceId = getDeviceId()
-                val deviceName = getDeviceName()
-
-                // 构建发现消息: DISCOVER_LENGKUBAO|设备ID|设备名称|配对码(可选)
-                val discoverMsg = if (pairingCode.isNullOrBlank()) {
-                    "DISCOVER_LENGKUBAO|$deviceId|$deviceName"
-                } else {
-                    "DISCOVER_LENGKUBAO|$deviceId|$deviceName|$pairingCode"
-                }
-
-                val sendData = discoverMsg.toByteArray(Charsets.UTF_8)
-                val broadcastPacket = DatagramPacket(
-                    sendData,
-                    sendData.size,
-                    InetAddress.getByName("255.255.255.255"),
-                    Constant.UDP_BROADCAST_PORT
-                )
-
-                Log.d(TAG, "📤 发送UDP广播: $discoverMsg")
-                broadcastSocket?.send(broadcastPacket)
-
-                // 等待响应
-                val startTime = System.currentTimeMillis()
-                val responseBuffer = ByteArray(1024)
-                val foundDevices = mutableListOf<DiscoveredDevice>()
-
-                while (System.currentTimeMillis() - startTime < Constant.UDP_BROADCAST_TIMEOUT) {
-                    try {
-                        val receivePacket = DatagramPacket(responseBuffer, responseBuffer.size)
-                        broadcastSocket?.receive(receivePacket)
-
-                        val response = String(receivePacket.data, 0, receivePacket.length, Charsets.UTF_8)
-                        val serverIp = receivePacket.address.hostAddress
-
-                        Log.d(TAG, "📥 收到UDP响应: $response 来自 $serverIp")
-
-                        // 解析服务器响应: LENGKUBAO_SERVER|服务器名称|配对码|TCP端口
-                        val parts = response.split("|")
-                        if (parts.isNotEmpty() && parts[0] == Constant.UDP_MSG_RESPONSE && parts.size >= 4) {
-                            val serverName = parts[1]
-                            val serverPairingCode = parts[2]
-                            val serverPort = parts[3].toIntOrNull() ?: 8080
-
-                            val device = DiscoveredDevice(
-                                deviceName = serverName,
-                                ip = serverIp,
-                                port = serverPort,
-                                pairingCode = serverPairingCode
-                            )
-
-                            // 如果指定了配对码，只添加匹配的
-                            if (pairingCode.isNullOrBlank() || serverPairingCode == pairingCode) {
-                                if (!foundDevices.any { it.ip == serverIp }) {
-                                    foundDevices.add(device)
-                                    Log.i(TAG, "✅ 发现服务器: $serverName ($serverIp:$serverPort) 配对码: $serverPairingCode")
-
-                                    // 发送广播
-                                    sendDeviceFoundBroadcast(device)
-                                }
-                            }
-                        }
-                    } catch (e: SocketTimeoutException) {
-                        // 超时正常，继续等待剩余时间
-                    }
-                }
-
+                val foundDevices = discoverServers(pairingCode)
                 _discoveredDevices.value = foundDevices
-
-                if (foundDevices.isEmpty()) {
-                    _messageFlow.value = "未找到任何服务器"
+                _messageFlow.value = if (foundDevices.isEmpty()) {
+                    "未找到任何服务器"
                 } else {
-                    _messageFlow.value = "找到 ${foundDevices.size} 个服务器"
+                    "找到 ${foundDevices.size} 个服务器"
                 }
-
             } catch (e: Exception) {
                 Log.e(TAG, "❌ UDP发现异常: ${e.message}", e)
                 _messageFlow.value = "扫描异常: ${e.message}"
             } finally {
-                try {
-                    broadcastSocket?.close()
-                } catch (e: Exception) { }
+                broadcastSocket?.close()
+                broadcastSocket = null
                 _isScanning.value = false
             }
         }
@@ -211,47 +260,78 @@ class UdpDeviceDiscovery private constructor(private val context: Context) {
     /**
      * 自动连接：先UDP发现，然后自动选择第一个匹配的服务器
      */
-    suspend fun autoConnect(pairingCode: String): DiscoveredDevice? {
+    suspend fun autoConnect(
+        pairingCode: String,
+        announceTimeoutMs: Long = 3000L,
+        discoverTimeoutMs: Long = Constant.UDP_BROADCAST_TIMEOUT + 2000,
+    ): DiscoveredDevice? {
         return withContext(Dispatchers.IO) {
             try {
                 _messageFlow.value = "正在UDP自动发现服务器..."
 
-                // 先快速扫描
-                startDiscovery(pairingCode)
-
-                // 等待扫描完成
-                var retry = 0
-                while (_isScanning.value && retry < 10) {
-                    delay(500)
-                    retry++
+                listenForServerAnnounce(pairingCode, announceTimeoutMs)?.let { announceDevice ->
+                    _messageFlow.value = "✅ 收到服务器广播: ${announceDevice.deviceName}"
+                    return@withContext announceDevice
                 }
 
-                // 获取发现的设备
-                val devices = _discoveredDevices.value
+                val devices = discoverServers(pairingCode, discoverTimeoutMs)
 
                 if (devices.isNotEmpty()) {
-                    // 优先选择配对码完全匹配的
                     val matchedDevice = devices.firstOrNull { it.pairingCode == pairingCode }
                     val selectedDevice = matchedDevice ?: devices.first()
-
                     _messageFlow.value = "✅ 自动发现服务器: ${selectedDevice.deviceName}"
 
-                    // 可选：发送UDP配对请求验证
                     val verified = sendPairingRequest(selectedDevice.ip, pairingCode)
                     if (verified) {
                         Log.i(TAG, "✅ UDP配对验证成功")
                     }
-
                     return@withContext selectedDevice
-                } else {
-                    _messageFlow.value = "❌ 未发现任何服务器"
-                    return@withContext null
                 }
 
+                _messageFlow.value = "❌ 未发现任何服务器"
+                null
             } catch (e: Exception) {
                 Log.e(TAG, "❌ 自动连接失败: ${e.message}")
                 _messageFlow.value = "自动连接失败: ${e.message}"
-                return@withContext null
+                null
+            }
+        }
+    }
+
+    /**
+     * 被动监听电脑端广播（LENGKUBAO_SERVER_ANNOUNCE），用于冷启动重连。
+     */
+    suspend fun listenForServerAnnounce(pairingCode: String, timeoutMs: Long = 3000L): DiscoveredDevice? {
+        return withContext(Dispatchers.IO) {
+            var socket: DatagramSocket? = null
+            try {
+                socket = DatagramSocket(null).apply {
+                    reuseAddress = true
+                    bind(InetSocketAddress(0))
+                    soTimeout = 500
+                }
+                val buffer = ByteArray(1024)
+                val deadline = System.currentTimeMillis() + timeoutMs
+                while (System.currentTimeMillis() < deadline) {
+                    try {
+                        val packet = DatagramPacket(buffer, buffer.size)
+                        socket.receive(packet)
+                        val response = String(packet.data, 0, packet.length, Charsets.UTF_8)
+                        val serverIp = packet.address?.hostAddress ?: continue
+                        parseServerUdpMessage(response, serverIp, pairingCode)?.let { return@withContext it }
+                    } catch (_: SocketTimeoutException) {
+                        // 继续等待
+                    }
+                }
+                null
+            } catch (e: Exception) {
+                Log.w(TAG, "⚠️ 监听服务器广播失败: ${e.message}")
+                null
+            } finally {
+                try {
+                    socket?.close()
+                } catch (_: Exception) {
+                }
             }
         }
     }

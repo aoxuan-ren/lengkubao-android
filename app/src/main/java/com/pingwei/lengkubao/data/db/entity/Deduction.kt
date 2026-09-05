@@ -15,6 +15,12 @@ data class Deduction(
     @ColumnInfo(name = "amount")
     val amount: Double,                    // 对应电脑端 amount
 
+    @ColumnInfo(name = "quantity", defaultValue = "0")
+    val quantity: Int = 0,
+
+    @ColumnInfo(name = "unit_price", defaultValue = "0")
+    val unitPrice: Double = 0.0,
+
     @ColumnInfo(name = "deduct_date", index = true)
     val deductDate: String,                // 对应电脑端 deduct_date (yyyy-MM-dd)
 

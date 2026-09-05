@@ -2,9 +2,13 @@ package com.pingwei.lengkubao.data.db.entity
 
 import androidx.room.ColumnInfo
 import androidx.room.Entity
+import androidx.room.Index
 import androidx.room.PrimaryKey
 
-@Entity(tableName = "presale_bill")
+@Entity(
+    tableName = "presale_bill",
+    indices = [Index(value = ["source_record_id"], unique = true)]
+)
 data class PreSaleBill(
     @PrimaryKey(autoGenerate = true)
     val id: Long = 0,
@@ -54,7 +58,17 @@ data class PreSaleBill(
     val createTime: Long = System.currentTimeMillis(),
 
     @ColumnInfo(name = "sync_status")
-    val syncStatus: Int = 0
+    val syncStatus: Int = 0,
+
+    @ColumnInfo(name = "source_record_id")
+    val sourceRecordId: String? = null,
+
+    @ColumnInfo(name = "source_device_id")
+    val sourceDeviceId: String? = null,
+
+    /** PC 增量 commit_seq，用于 LWW */
+    @ColumnInfo(name = "remote_updated_at")
+    val remoteUpdatedAt: Long = 0L
 )
 
 object PreSaleMode {

@@ -38,7 +38,6 @@ import androidx.compose.ui.unit.sp
 import androidx.lifecycle.lifecycleScope
 import com.pingwei.lengkubao.ui.config.ConfigMainActivity
 import com.pingwei.lengkubao.ui.customer.CustomerAddActivity
-import com.pingwei.lengkubao.ui.customer.CustomerListActivity
 import com.pingwei.lengkubao.ui.instock.InStockActivity
 import com.pingwei.lengkubao.ui.theme.AppDimens
 import com.pingwei.lengkubao.ui.theme.LengkubaoTheme
@@ -56,8 +55,11 @@ import com.pingwei.lengkubao.ui.query.packaging.PackagingQueryActivity
 import com.pingwei.lengkubao.ui.query.saleout.SaleOutQueryActivity
 import com.pingwei.lengkubao.data.db.AppDatabase
 import com.pingwei.lengkubao.service.TcpSyncService
-import com.pingwei.lengkubao.sync.TcpSyncManager
+import com.pingwei.lengkubao.sync.rememberTcpConnectionStatus
+import com.pingwei.lengkubao.utils.Constant
 import com.pingwei.lengkubao.ui.advancededuction.AdvanceDeductionActivity
+import com.pingwei.lengkubao.ui.cashflow.CashFlowActivity
+import com.pingwei.lengkubao.ui.statistics.InStockStatisticsActivity
 import kotlinx.coroutines.flow.first
 
 class MainActivity : ComponentActivity() {
@@ -79,8 +81,10 @@ class MainActivity : ComponentActivity() {
 
 
         checkRequiredPermissions()
-        // 应用启动时自动启动TCP同步服务
-        startTcpSyncService()
+        val prefs = getSharedPreferences("sync_config", MODE_PRIVATE)
+        if (prefs.getBoolean(Constant.PREF_AUTO_SYNC, Constant.PREF_AUTO_SYNC_DEFAULT)) {
+            startTcpSyncService()
+        }
         setContent {
             LengkubaoTheme {
                 Surface(
@@ -129,9 +133,8 @@ class MainActivity : ComponentActivity() {
         var pendingDetails by remember { mutableStateOf<Map<String, Int>?>(null) }
         var showSyncDialog by remember { mutableStateOf(false) }
 
-        // 新增：TCP连接状态管理
-        var tcpConnectionState by remember { mutableStateOf("正在连接...") }
-        var isTcpConnected by remember { mutableStateOf(false) }
+        // TCP连接状态（年份切换后自动换绑当前 TcpSyncManager）
+        val (isTcpConnected, tcpConnectionState) = rememberTcpConnectionStatus()
 
         // 初始加载未同步数量
         LaunchedEffect(Unit) {
@@ -207,23 +210,6 @@ class MainActivity : ComponentActivity() {
             }
         }
 
-        // 新增：监听TCP连接状态，实时更新UI
-        LaunchedEffect(Unit) {
-            val database = AppDatabase.getInstance(context)
-            val syncManager = TcpSyncManager.getInstance(context, database)
-            syncManager.connectionState.collect { state ->
-                isTcpConnected = state == TcpSyncManager.ConnectionState.CONNECTED
-                tcpConnectionState = when (state) {
-                    TcpSyncManager.ConnectionState.CONNECTED -> "✅ 已连接"
-                    TcpSyncManager.ConnectionState.CONNECTING -> "🔌 连接中..."
-                    TcpSyncManager.ConnectionState.ERROR -> "❌ 连接失败"
-                    TcpSyncManager.ConnectionState.DISCONNECTED -> "📴 已断开"
-                    TcpSyncManager.ConnectionState.SYNCING -> "🔄 同步中..."
-                    TcpSyncManager.ConnectionState.WAITING_RECONNECT -> "⏳ 等待重连..."
-                }
-            }
-        }
-
         Scaffold(
             topBar = {
                 TopAppBar(
@@ -292,165 +278,147 @@ class MainActivity : ComponentActivity() {
                         .fillMaxSize()
                         .verticalScroll(queryScrollState)
                 ) {
-                    // 待同步提醒卡片（有未同步数据时显示）
-                    if (pendingTotal > 0) {
-                        PendingSyncWarningCard(
-                            pendingCount = pendingTotal,
-                            onClick = { showSyncDialog = true },
-                            modifier = Modifier.padding(
-                                horizontal = AppDimens.pagePadding,
-                                vertical = AppDimens.itemSpacing
-                            )
-                        )
-                    }
-
-                    // 主要功能按钮（5行，可纵向滑动查看）
-                    Column(
+                    // 8 个主功能：刚好占满首屏；条形查询在下方滑动可见
+                    Box(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .height(viewportHeight * 1.15f)
-                            .padding(horizontal = AppDimens.pagePadding),
-                        verticalArrangement = Arrangement.spacedBy(AppDimens.itemSpacing)
+                            .height(viewportHeight)
                     ) {
-                    // 核心业务按钮行（入库开单、客户报账）
-                    ButtonRow(
-                        modifier = Modifier.weight(1f),
-                        button1 = {
-                        ActionButton(
-                            text = "入库开单",
-                            icon = Icons.Default.Input,
-                            color = Color(0xFF4CAF50),
-                            onClick = {
-                                context.startActivity(Intent(context, InStockActivity::class.java))
-                            }
-                        )
-                    },
-                    button2 = {
-                        ActionButton(
-                            text = "客户报账",
-                            icon = Icons.Default.ShoppingCart,
-                            color = Color(0xFF2196F3),
-                            onClick = {
-                                context.startActivity(Intent(context, SaleOutActivity::class.java))
-                            }
-                        )
-                    }
-                    )
-
-                    // 包装记账和入库统计按钮行
-                    ButtonRow(
-                        modifier = Modifier.weight(1f),
-                        button1 = {
-                        ActionButton(
-                            text = "包装记账",
-                            icon = Icons.Default.Inventory2,
-                            color = Color(0xFF9C27B0),
-                            onClick = {
-                                context.startActivity(Intent(context, PackagingActivity::class.java))
-                            }
-                        )
-                    },
-                    button2 = {
-                        ActionButton(
-                            text = "入库统计",
-                            icon = Icons.Default.BarChart,  // 使用统计图表图标
-                            color = Color(0xFF4CAF50),  // 使用绿色，与入库开单保持一致
-                            onClick = {
-                                try {
-                                    // 跳转到入库统计页面
-                                    val intent = Intent(context, Class.forName("com.pingwei.lengkubao.ui.statistics.InStockStatisticsActivity"))
-                                    context.startActivity(intent)
-                                } catch (e: Exception) {
-                                    Toast.makeText(context, "入库统计功能开发中", Toast.LENGTH_SHORT).show()
-                                    e.printStackTrace()
+                        Column(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .padding(AppDimens.pagePadding),
+                            verticalArrangement = Arrangement.spacedBy(AppDimens.itemSpacing)
+                        ) {
+                            ButtonRow(
+                                modifier = Modifier.weight(1f),
+                                button1 = {
+                                    ActionButton(
+                                        text = "入库开单",
+                                        icon = Icons.Default.Input,
+                                        color = Color(0xFF4CAF50),
+                                        onClick = {
+                                            context.startActivity(Intent(context, InStockActivity::class.java))
+                                        }
+                                    )
+                                },
+                                button2 = {
+                                    ActionButton(
+                                        text = "客户报账",
+                                        icon = Icons.Default.ShoppingCart,
+                                        color = Color(0xFF2196F3),
+                                        onClick = {
+                                            context.startActivity(Intent(context, SaleOutActivity::class.java))
+                                        }
+                                    )
                                 }
-                            }
-                        )
-                    }
-                    )
+                            )
 
-                    // 客户管理与配置行（客户列表、基础配置）
-                    ButtonRow(
-                        modifier = Modifier.weight(1f),
-                        button1 = {
-                        ActionButton(
-                            text = "客户列表",
-                            icon = Icons.Default.People,
-                            color = Color(0xFF607D8B),
-                            onClick = {
-                                context.startActivity(Intent(context, CustomerListActivity::class.java))
-                            }
-                        )
-                    },
-                    button2 = {
-                        ActionButton(
-                            text = "基础配置",
-                            icon = Icons.Default.Settings,
-                            color = Color(0xFF795548),
-                            onClick = {
-                                context.startActivity(Intent(context, ConfigMainActivity::class.java))
-                            }
-                        )
-                    }
-                    )
-
-                    // 预支扣款和TCP配置按钮行
-                    ButtonRow(
-                        modifier = Modifier.weight(1f),
-                        button1 = {
-                        ActionButton(
-                            text = "预支扣款",
-                            icon = Icons.Default.AttachMoney,
-                            color = Color(0xFFFF9800),
-                            onClick = {
-                                context.startActivity(Intent(context, AdvanceDeductionActivity::class.java))
-                            }
-                        )
-                    },
-                    button2 = {
-                        ActionButton(
-                            text = "TCP配置",
-                            icon = Icons.Default.Sync,
-                            color = Color(0xFF009688),
-                            onClick = {
-                                try {
-                                    val intent = Intent(context, Class.forName("com.pingwei.lengkubao.ui.sync.TcpSyncConfigActivity"))
-                                    context.startActivity(intent)
-                                } catch (e: Exception) {
-                                    Toast.makeText(context, "TCP配置界面未找到", Toast.LENGTH_SHORT).show()
-                                    e.printStackTrace()
+                            ButtonRow(
+                                modifier = Modifier.weight(1f),
+                                button1 = {
+                                    ActionButton(
+                                        text = "包装记账",
+                                        icon = Icons.Default.Inventory2,
+                                        color = Color(0xFF9C27B0),
+                                        onClick = {
+                                            context.startActivity(Intent(context, PackagingActivity::class.java))
+                                        }
+                                    )
+                                },
+                                button2 = {
+                                    ActionButton(
+                                        text = "收支流水",
+                                        icon = Icons.Default.AccountBalance,
+                                        color = Color(0xFF00897B),
+                                        onClick = {
+                                            context.startActivity(Intent(context, CashFlowActivity::class.java))
+                                        }
+                                    )
                                 }
-                            }
-                        )
-                    }
-                    )
+                            )
 
-                    // 预售出库按钮行
-                    ButtonRow(
-                        modifier = Modifier.weight(1f),
-                        button1 = {
-                        ActionButton(
-                            text = "预售出库",
-                            icon = Icons.Default.LocalShipping,
-                            color = Color(0xFFE91E63),
-                            onClick = {
-                                context.startActivity(Intent(context, PreSaleOutActivity::class.java))
-                            }
-                        )
-                    },
-                    button2 = {
-                        Box(Modifier.fillMaxSize())
-                    }
-                    )
+                            ButtonRow(
+                                modifier = Modifier.weight(1f),
+                                button1 = {
+                                    ActionButton(
+                                        text = "预售出库",
+                                        icon = Icons.Default.LocalShipping,
+                                        color = Color(0xFFE91E63),
+                                        onClick = {
+                                            context.startActivity(Intent(context, PreSaleOutActivity::class.java))
+                                        }
+                                    )
+                                },
+                                button2 = {
+                                    ActionButton(
+                                        text = "预支扣款",
+                                        icon = Icons.Default.AttachMoney,
+                                        color = Color(0xFFFF9800),
+                                        onClick = {
+                                            context.startActivity(Intent(context, AdvanceDeductionActivity::class.java))
+                                        }
+                                    )
+                                }
+                            )
+
+                            ButtonRow(
+                                modifier = Modifier.weight(1f),
+                                button1 = {
+                                    ActionButton(
+                                        text = "基础配置",
+                                        icon = Icons.Default.Settings,
+                                        color = Color(0xFF795548),
+                                        onClick = {
+                                            context.startActivity(Intent(context, ConfigMainActivity::class.java))
+                                        }
+                                    )
+                                },
+                                button2 = {
+                                    ActionButton(
+                                        text = "TCP配置",
+                                        icon = Icons.Default.Sync,
+                                        color = Color(0xFF009688),
+                                        onClick = {
+                                            try {
+                                                val intent = Intent(
+                                                    context,
+                                                    Class.forName("com.pingwei.lengkubao.ui.sync.TcpSyncConfigActivity")
+                                                )
+                                                context.startActivity(intent)
+                                            } catch (e: Exception) {
+                                                Toast.makeText(context, "TCP配置界面未找到", Toast.LENGTH_SHORT).show()
+                                                e.printStackTrace()
+                                            }
+                                        }
+                                    )
+                                }
+                            )
+                        }
+
+                        if (pendingTotal > 0) {
+                            PendingSyncWarningCard(
+                                pendingCount = pendingTotal,
+                                onClick = { showSyncDialog = true },
+                                modifier = Modifier
+                                    .align(Alignment.TopCenter)
+                                    .padding(horizontal = AppDimens.pagePadding, vertical = AppDimens.itemSpacing)
+                            )
+                        }
                     }
 
-                    // 下方查询区域，向下滑动查看
+                    // 条形查询按钮：主功能下方，下滑查看
                     Column(
                         modifier = Modifier
                             .fillMaxWidth()
                             .padding(AppDimens.pagePadding),
                         verticalArrangement = Arrangement.spacedBy(AppDimens.itemSpacing)
                     ) {
+                        QueryButton(
+                            text = "入库统计",
+                            icon = Icons.Default.BarChart,
+                            targetClass = InStockStatisticsActivity::class.java
+                        )
                         QueryButton(
                             text = "入库单查询",
                             icon = Icons.Default.Receipt,
@@ -462,7 +430,7 @@ class MainActivity : ComponentActivity() {
                             targetClass = PackagingQueryActivity::class.java
                         )
                         QueryButton(
-                            text = "销售单查询",
+                            text = "报账单查询",
                             icon = Icons.Default.Receipt,
                             targetClass = SaleOutQueryActivity::class.java
                         )
@@ -471,27 +439,31 @@ class MainActivity : ComponentActivity() {
                             icon = Icons.Default.LocalShipping,
                             targetClass = PreSaleQueryActivity::class.java
                         )
+                        QueryButton(
+                            text = "预支扣款查询",
+                            icon = Icons.Default.AttachMoney,
+                            targetClass = com.pingwei.lengkubao.ui.query.advancededuction.AdvanceDeductionQueryActivity::class.java
+                        )
                         CopyrightText()
                     }
                 }
-            }
 
-            // 同步状态弹窗
-            if (showSyncDialog) {
-                SyncStatusDialog(
-                    pendingDetails = pendingDetails,
-                    onDismiss = { showSyncDialog = false },
-                    onSyncNow = {
-                        TcpSyncService.syncPendingNow(context)
-                        Toast.makeText(context, "已提交后台同步请求", Toast.LENGTH_SHORT).show()
-                        activityScope.launch {
-                            refreshPendingSyncCount(context) { count, details ->
-                                pendingTotal = count
-                                pendingDetails = details
+                if (showSyncDialog) {
+                    SyncStatusDialog(
+                        pendingDetails = pendingDetails,
+                        onDismiss = { showSyncDialog = false },
+                        onSyncNow = {
+                            TcpSyncService.syncPendingNow(context)
+                            Toast.makeText(context, "已提交后台同步请求", Toast.LENGTH_SHORT).show()
+                            activityScope.launch {
+                                refreshPendingSyncCount(context) { count, details ->
+                                    pendingTotal = count
+                                    pendingDetails = details
+                                }
                             }
                         }
-                    }
-                )
+                    )
+                }
             }
         }
     }
@@ -511,16 +483,23 @@ class MainActivity : ComponentActivity() {
         val pendingPack = database.packagingBillDao().getAllBills().first().count { !it.isSynced }
 
         // 新增：查询未同步的预支款和扣款 - 修正写法
-        val pendingAdvances = database.advanceDao().getUnsyncedAdvances().size  // 直接取 size
-        val pendingDeductions = database.deductionDao().getUnsyncedDeductions().size  // 直接取 size
+        val pendingAdvances = database.advanceDao().getUnsyncedAdvances().size
+        val pendingDeductions = database.deductionDao().getUnsyncedDeductions().size
+        val pendingPresales = database.preSaleBillDao().getUnsyncedBills().size
+        val pendingPresalePayments = database.paymentRecordDao().getUnsyncedPayments().size
+        val pendingLedger = database.ledgerEntryDao().getUnsyncedEntries().size
 
-        val total = pendingIn + pendingSale + pendingPack + pendingAdvances + pendingDeductions
+        val total = pendingIn + pendingSale + pendingPack + pendingAdvances + pendingDeductions +
+            pendingPresales + pendingPresalePayments + pendingLedger
         val details = mapOf(
             "入库单" to pendingIn,
             "销售单" to pendingSale,
             "包装单" to pendingPack,
             "预支款" to pendingAdvances,
             "扣款" to pendingDeductions,
+            "预售单" to pendingPresales,
+            "预售收款" to pendingPresalePayments,
+            "收支流水" to pendingLedger,
             "总计" to total
         )
 
@@ -684,7 +663,7 @@ fun ActionButton(
         Column(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(AppDimens.cardPadding),
+                .padding(horizontal = 8.dp, vertical = 6.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.Center
         ) {
@@ -695,13 +674,13 @@ fun ActionButton(
                 tint = color
             )
 
-            Spacer(modifier = Modifier.height(8.dp))
+            Spacer(modifier = Modifier.height(6.dp))
             Text(
                 text = text,
-                fontSize = 16.sp,
+                fontSize = 15.sp,
                 fontWeight = FontWeight.Medium,
                 textAlign = TextAlign.Center,
-                maxLines = 2,
+                maxLines = 1,
                 lineHeight = 18.sp
             )
         }

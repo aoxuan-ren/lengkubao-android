@@ -14,11 +14,12 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import com.pingwei.lengkubao.data.db.entity.Location
 import com.pingwei.lengkubao.ui.theme.AppDimens
+import com.pingwei.lengkubao.ui.common.rememberDismissKeyboard
+import com.pingwei.lengkubao.ui.common.rememberHideKeyboardOnly
 import com.pingwei.lengkubao.data.db.entity.Operator
 import com.pingwei.lengkubao.data.db.entity.Product
 import com.pingwei.lengkubao.data.db.entity.Customer
 import com.pingwei.lengkubao.utils.CustomerSearchFilter
-import com.pingwei.lengkubao.utils.OperatorSearchFilter
 
 // ==================== 客户选择对话框 ====================
 @Composable
@@ -28,6 +29,7 @@ fun CustomerSelectorDialog(
     onCustomerSelected: (Customer) -> Unit
 ) {
     var searchText by remember { mutableStateOf("") }
+    val dismissKeyboard = rememberDismissKeyboard()
     val filteredCustomers = remember(searchText, customers) {
         CustomerSearchFilter.filter(customers, searchText)
     }
@@ -41,10 +43,12 @@ fun CustomerSelectorDialog(
                 OutlinedTextField(
                     value = searchText,
                     onValueChange = { searchText = it },
-                    label = { Text(CustomerSearchFilter.PLACEHOLDER) },
+                    label = { Text("搜索客户") },
+                    placeholder = { Text(CustomerSearchFilter.PLACEHOLDER) },
+                    textStyle = MaterialTheme.typography.bodyMedium,
                     modifier = Modifier
                         .fillMaxWidth()
-                        .height(AppDimens.buttonHeight),
+                        .heightIn(min = AppDimens.searchFieldHeight),
                     leadingIcon = {
                         Icon(Icons.Default.Search, contentDescription = "搜索")
                     },
@@ -98,6 +102,7 @@ fun CustomerSelectorDialog(
                                 modifier = Modifier
                                     .fillMaxWidth()
                                     .clickable {
+                                        dismissKeyboard()
                                         onCustomerSelected(customer)
                                         onDismiss()
                                     }
@@ -186,6 +191,8 @@ fun LocationSelectorDialog(
     onDismiss: () -> Unit,
     onLocationSelected: (Location) -> Unit
 ) {
+    val hideKeyboard = rememberHideKeyboardOnly()
+
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("选择库位") },
@@ -206,7 +213,7 @@ fun LocationSelectorDialog(
                     items(locations) { location ->
                         ListItem(
                             headlineContent = {
-                                Text("${location.locationName} (${location.locationNo})")
+                                Text(location.locationName)
                             },
                             supportingContent = {
                                 if (location.description.isNotEmpty()) {
@@ -225,6 +232,7 @@ fun LocationSelectorDialog(
                                 .clickable(
                                     enabled = location.enabled,
                                     onClick = {
+                                        hideKeyboard()
                                         onLocationSelected(location)
                                         onDismiss()
                                     }
@@ -256,90 +264,55 @@ fun OperatorSelectorDialog(
     onDismiss: () -> Unit,
     onOperatorSelected: (Operator) -> Unit
 ) {
-    var searchText by remember { mutableStateOf("") }
-    val filteredOperators = remember(searchText, operators) {
-        OperatorSearchFilter.filter(operators, searchText)
-    }
+    val hideKeyboard = rememberHideKeyboardOnly()
 
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("选择经手人") },
         text = {
-            Column {
-                OutlinedTextField(
-                    value = searchText,
-                    onValueChange = { searchText = it },
-                    label = { Text(OperatorSearchFilter.PLACEHOLDER) },
+            if (operators.isEmpty()) {
+                Box(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .height(AppDimens.buttonHeight),
-                    leadingIcon = {
-                        Icon(Icons.Default.Search, contentDescription = "搜索")
-                    },
-                    singleLine = true
-                )
-
-                Spacer(modifier = Modifier.height(AppDimens.sectionSpacing))
-
-                if (operators.isEmpty()) {
-                    Box(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(100.dp),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Text("暂无经手人数据")
-                    }
-                } else if (filteredOperators.isEmpty()) {
-                    Box(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(150.dp),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                            Icon(
-                                Icons.Default.PersonOff,
-                                contentDescription = "未找到经手人",
-                                tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                                modifier = Modifier.size(48.dp)
+                        .height(100.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text("暂无经手人数据")
+                }
+            } else {
+                LazyColumn(
+                    modifier = Modifier.heightIn(max = 400.dp)
+                ) {
+                    items(operators) { operator ->
+                        ListItem(
+                            headlineContent = {
+                                Text(operator.name)
+                            },
+                            leadingContent = {
+                                Icon(
+                                    Icons.Default.Person,
+                                    contentDescription = null,
+                                    tint = if (operator.enabled) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error
+                                )
+                            },
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable(
+                                    enabled = operator.enabled,
+                                    onClick = {
+                                        hideKeyboard()
+                                        onOperatorSelected(operator)
+                                        onDismiss()
+                                    }
+                                ),
+                            colors = ListItemDefaults.colors(
+                                containerColor = if (operator.enabled)
+                                    MaterialTheme.colorScheme.surface
+                                else
+                                    MaterialTheme.colorScheme.surfaceVariant
                             )
-                            Spacer(modifier = Modifier.height(AppDimens.itemSpacing))
-                            Text(
-                                text = "未找到相关经手人",
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
-                        }
-                    }
-                } else {
-                    LazyColumn(
-                        modifier = Modifier.heightIn(max = AppDimens.dialogListMaxHeight)
-                    ) {
-                        items(filteredOperators) { operator ->
-                            ListItem(
-                                headlineContent = { Text(operator.name) },
-                                supportingContent = {
-                                    Text("编号: ${operator.operatorNo}")
-                                },
-                                leadingContent = {
-                                    Icon(
-                                        Icons.Default.Person,
-                                        contentDescription = null,
-                                        tint = if (operator.enabled) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error
-                                    )
-                                },
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .clickable(
-                                        enabled = operator.enabled,
-                                        onClick = {
-                                            onOperatorSelected(operator)
-                                            onDismiss()
-                                        }
-                                    )
-                            )
-                            Divider()
-                        }
+                        )
+                        Divider()
                     }
                 }
             }
@@ -361,6 +334,7 @@ fun ProductSelectorDialog(
 ) {
     var quantity by remember { mutableStateOf("1") }
     var selectedProduct by remember { mutableStateOf<Product?>(null) }
+    val dismissKeyboard = rememberDismissKeyboard()
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -392,12 +366,18 @@ fun ProductSelectorDialog(
                                 leadingContent = {
                                     RadioButton(
                                         selected = selectedProduct?.id == product.id,
-                                        onClick = { selectedProduct = product }
+                                        onClick = {
+                                            dismissKeyboard()
+                                            selectedProduct = product
+                                        }
                                     )
                                 },
                                 modifier = Modifier
                                     .fillMaxWidth()
-                                    .clickable { selectedProduct = product }
+                                    .clickable {
+                                        dismissKeyboard()
+                                        selectedProduct = product
+                                    }
                             )
                             Divider()
                         }

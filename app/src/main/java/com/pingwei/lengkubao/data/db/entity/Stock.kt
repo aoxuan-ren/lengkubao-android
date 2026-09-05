@@ -1,9 +1,7 @@
-// data/db/entity/Stock.kt - 确保有预留字段
 package com.pingwei.lengkubao.data.db.entity
 
 import androidx.room.ColumnInfo
 import androidx.room.Entity
-import androidx.room.Ignore
 import androidx.room.PrimaryKey
 
 @Entity(tableName = "stock")
@@ -24,22 +22,18 @@ data class Stock(
     @ColumnInfo(name = "location_id")
     val locationId: Long,
 
-    @ColumnInfo(name = "location_no")
-    val locationNo: String,
-
     @ColumnInfo(name = "current_quantity")
     var currentQuantity: Int = 0,
 
     @ColumnInfo(name = "reserved_quantity")
-    var reservedQuantity: Int = 0, // ✅ 预留库存字段
+    var reservedQuantity: Int = 0,
 
     @ColumnInfo(name = "last_updated")
     var lastUpdated: Long = System.currentTimeMillis(),
 
     @ColumnInfo(name = "last_bill_no")
-    var lastBillNo: String = ""
+    var lastBillNo: String = "",
 ) {
-
     val availableQuantity: Int
         get() = currentQuantity - reservedQuantity
 }

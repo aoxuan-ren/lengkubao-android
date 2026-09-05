@@ -9,21 +9,24 @@ import com.pingwei.lengkubao.data.db.entity.*
 import com.pingwei.lengkubao.data.model.ProductWithStock
 import com.pingwei.lengkubao.service.PreSaleService
 import com.pingwei.lengkubao.service.StockService
+import com.pingwei.lengkubao.utils.PreSaleSyncHelper
+import com.pingwei.lengkubao.utils.SyncTrigger
 import com.pingwei.lengkubao.ui.common.ConfigManager
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 
 class PreSaleOutViewModel(application: Application) : AndroidViewModel(application) {
     private val TAG = "PreSaleOutViewModel"
     private val context = application.applicationContext
-    private val database = AppDatabase.getInstance(context)
-    private val stockService = StockService(database.stockDao(), database.stockChangeDao())
-    private val preSaleService = PreSaleService(database, stockService)
+    private val database by lazy { AppDatabase.getInstance(context) }
+    private val stockService by lazy { StockService(database.stockDao(), database.stockChangeDao()) }
+    private val preSaleService by lazy { PreSaleService(database, stockService) }
     private lateinit var configManager: ConfigManager
 
-    private val _saleMode = MutableStateFlow(PreSaleMode.PRESALE)
+    private val _saleMode = MutableStateFlow(PreSaleMode.DIRECT_OUT)
     val saleMode: StateFlow<String> = _saleMode.asStateFlow()
 
     private val _selectedBuyer = MutableStateFlow<Customer?>(null)
@@ -56,9 +59,12 @@ class PreSaleOutViewModel(application: Application) : AndroidViewModel(applicati
         object Loading : SaveResult()
     }
 
-    val buyers = database.customerDao().getCustomersByType(CustomerType.BUYER)
-    val allLocations = database.locationDao().getAllLocations()
-    val allOperators = database.operatorDao().getAllOperators()
+    val buyers by lazy {
+        database.customerDao().getCustomersByType(CustomerType.BUYER)
+            .map { list -> list.filter { it.enabled } }
+    }
+    val allLocations by lazy { database.locationDao().getAllLocations() }
+    val allOperators by lazy { database.operatorDao().getAllOperators() }
 
     val totalAmount: Double get() = _items.value.sumOf { it.amount }
     val totalQuantity: Int get() = _items.value.sumOf { it.quantity }
@@ -104,6 +110,10 @@ class PreSaleOutViewModel(application: Application) : AndroidViewModel(applicati
                 Log.w(TAG, "加载默认值失败: ${e.message}")
             }
         }
+    }
+
+    fun refreshStock() {
+        _selectedLocation.value?.id?.let { loadProductsWithStock(it) }
     }
 
     private fun loadProductsWithStock(locationId: Long) {
@@ -165,7 +175,7 @@ class PreSaleOutViewModel(application: Application) : AndroidViewModel(applicati
         _items.value = _items.value.filter { it.productId != productId }
     }
 
-    fun saveBill(initialPayment: Double = 0.0, payMethod: String = PayMethod.CASH) {
+    fun saveBill(initialPayment: Double = 0.0, payMethod: String = PayMethod.WECHAT) {
         viewModelScope.launch {
             _saveResult.value = SaveResult.Loading
             val validation = when {
@@ -191,6 +201,11 @@ class PreSaleOutViewModel(application: Application) : AndroidViewModel(applicati
             )
             result.fold(
                 onSuccess = { (billId, billNo) ->
+                    viewModelScope.launch {
+                        PreSaleSyncHelper.ensureBillSourceIdentity(context, billId)
+                        SyncTrigger.triggerPreSaleSync(context, billId)
+                    }
+                    refreshStock()
                     _saveResult.value = SaveResult.Success(billId, billNo)
                 },
                 onFailure = { e ->
@@ -215,5 +230,6 @@ class PreSaleOutViewModel(application: Application) : AndroidViewModel(applicati
         _items.value = emptyList()
         _remark.value = ""
         _saveResult.value = null
+        refreshStock()
     }
 }

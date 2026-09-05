@@ -1,14 +1,18 @@
 package com.pingwei.lengkubao.ui.presale
 
+import android.content.BroadcastReceiver
 import android.os.Bundle
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
@@ -16,14 +20,20 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.pingwei.lengkubao.data.db.entity.*
 import com.pingwei.lengkubao.ui.common.ProductQuantityPriceInput
+import com.pingwei.lengkubao.ui.instock.components.CompactSelectField
+import com.pingwei.lengkubao.ui.instock.components.LocationSelectorDialog
+import com.pingwei.lengkubao.ui.instock.components.OperatorSelectorDialog
 import com.pingwei.lengkubao.ui.instock.components.SearchableCustomerField
 import com.pingwei.lengkubao.ui.presale.viewmodel.PreSaleOutViewModel
 import com.pingwei.lengkubao.ui.theme.AppDimens
@@ -31,13 +41,22 @@ import com.pingwei.lengkubao.ui.theme.LengkubaoTheme
 import kotlinx.coroutines.launch
 
 class PreSaleOutActivity : ComponentActivity() {
+    private var yearChangeReceiver: BroadcastReceiver? = null
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        yearChangeReceiver = registerFinishOnFiscalYearChanged()
         setContent {
             LengkubaoTheme {
                 PreSaleOutScreen(viewModel = viewModel())
             }
         }
+    }
+
+    override fun onDestroy() {
+        unregisterFinishOnFiscalYearChanged(yearChangeReceiver)
+        yearChangeReceiver = null
+        super.onDestroy()
     }
 }
 
@@ -52,6 +71,7 @@ fun PreSaleOutScreen(viewModel: PreSaleOutViewModel) {
     val selectedLocation by viewModel.selectedLocation.collectAsState()
     val selectedOperator by viewModel.selectedOperator.collectAsState()
     val items by viewModel.items.collectAsState()
+    val remark by viewModel.remark.collectAsState()
     val productsWithStock by viewModel.productsWithStock.collectAsState()
     val saveResult by viewModel.saveResult.collectAsState()
     val buyers by viewModel.buyers.collectAsState(initial = emptyList())
@@ -110,12 +130,22 @@ fun PreSaleOutScreen(viewModel: PreSaleOutViewModel) {
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("预售出库") },
+                title = {
+                    Text(
+                        "预售出库",
+                        style = MaterialTheme.typography.titleMedium
+                    )
+                },
                 navigationIcon = {
-                    IconButton(onClick = { (context as? ComponentActivity)?.finish() }) {
+                    IconButton(
+                        onClick = { (context as? ComponentActivity)?.finish() },
+                        modifier = Modifier.size(40.dp)
+                    ) {
                         Icon(Icons.Default.ArrowBack, contentDescription = "返回")
                     }
-                }
+                },
+                expandedHeight = 48.dp,
+                windowInsets = WindowInsets.statusBars
             )
         },
         bottomBar = {
@@ -162,74 +192,124 @@ fun PreSaleOutScreen(viewModel: PreSaleOutViewModel) {
                 .padding(AppDimens.pagePadding),
             verticalArrangement = Arrangement.spacedBy(AppDimens.sectionSpacing)
         ) {
-            SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
-                SegmentedButton(
-                    selected = saleMode == PreSaleMode.PRESALE,
-                    onClick = { if (!isSaving) viewModel.setSaleMode(PreSaleMode.PRESALE) },
-                    shape = SegmentedButtonDefaults.itemShape(index = 0, count = 2)
-                ) { Text("预售模式") }
-                SegmentedButton(
-                    selected = saleMode == PreSaleMode.DIRECT_OUT,
-                    onClick = { if (!isSaving) viewModel.setSaleMode(PreSaleMode.DIRECT_OUT) },
-                    shape = SegmentedButtonDefaults.itemShape(index = 1, count = 2)
-                ) { Text("出库销售") }
-            }
-
-            Card(Modifier.fillMaxWidth()) {
-                Column(Modifier.padding(AppDimens.pagePadding), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                    Text(
-                        "买家信息",
-                        style = MaterialTheme.typography.titleMedium,
-                        color = MaterialTheme.colorScheme.primary
-                    )
-                    SearchableCustomerField(
-                        customers = buyers,
-                        selectedCustomer = selectedBuyer,
-                        onCustomerSelected = { if (!isSaving) viewModel.selectBuyer(it) },
-                        modifier = Modifier.fillMaxWidth(),
-                        isError = selectedBuyer == null,
-                        label = "选择买家"
-                    )
-                    OutlinedTextField(
-                        value = when {
-                            selectedBuyer == null -> "请先选择买家"
-                            selectedLocation != null -> selectedLocation!!.locationName
-                            else -> "请选择库位"
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(36.dp)
+                    .clip(MaterialTheme.shapes.small)
+                    .border(1.dp, MaterialTheme.colorScheme.outline, MaterialTheme.shapes.small),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Box(
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxHeight()
+                        .background(
+                            if (saleMode == PreSaleMode.DIRECT_OUT) {
+                                MaterialTheme.colorScheme.primary
+                            } else {
+                                MaterialTheme.colorScheme.surface
+                            }
+                        )
+                        .clickable(enabled = !isSaving) {
+                            viewModel.setSaleMode(PreSaleMode.DIRECT_OUT)
                         },
-                        onValueChange = {},
-                        readOnly = true,
-                        label = { Text("库位") },
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clickable(enabled = !isSaving && selectedBuyer != null) {
-                                showLocationDialog = true
-                            },
-                        leadingIcon = { Icon(Icons.Default.LocationOn, contentDescription = null) },
-                        trailingIcon = { Icon(Icons.Default.ArrowDropDown, contentDescription = null) },
-                        enabled = !isSaving && selectedBuyer != null
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        "出库",
+                        style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
+                        color = if (saleMode == PreSaleMode.DIRECT_OUT) {
+                            MaterialTheme.colorScheme.onPrimary
+                        } else {
+                            MaterialTheme.colorScheme.onSurfaceVariant
+                        }
+                    )
+                }
+                Box(
+                    modifier = Modifier
+                        .width(1.dp)
+                        .fillMaxHeight()
+                        .background(MaterialTheme.colorScheme.outline)
+                )
+                Box(
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxHeight()
+                        .background(
+                            if (saleMode == PreSaleMode.PRESALE) {
+                                MaterialTheme.colorScheme.primary
+                            } else {
+                                MaterialTheme.colorScheme.surface
+                            }
+                        )
+                        .clickable(enabled = !isSaving) {
+                            viewModel.setSaleMode(PreSaleMode.PRESALE)
+                        },
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        "预售",
+                        style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
+                        color = if (saleMode == PreSaleMode.PRESALE) {
+                            MaterialTheme.colorScheme.onPrimary
+                        } else {
+                            MaterialTheme.colorScheme.onSurfaceVariant
+                        }
                     )
                 }
             }
 
-            Card(Modifier.fillMaxWidth()) {
-                Column(Modifier.padding(AppDimens.pagePadding)) {
-                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                        Text("商品明细", style = MaterialTheme.typography.titleMedium)
-                        Text(
-                            "已选: ${items.size} 种",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.primary
-                        )
-                    }
-                    Spacer(Modifier.height(12.dp))
+            Card(modifier = Modifier.fillMaxWidth()) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(AppDimens.pagePadding),
+                    horizontalArrangement = Arrangement.spacedBy(AppDimens.itemSpacing),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    SearchableCustomerField(
+                        customers = buyers,
+                        selectedCustomer = selectedBuyer,
+                        onCustomerSelected = { if (!isSaving) viewModel.selectBuyer(it) },
+                        modifier = Modifier.weight(1.2f),
+                        isError = selectedBuyer == null,
+                        fieldHeight = 40.dp,
+                        fieldTextStyle = MaterialTheme.typography.bodyMedium.copy(
+                            fontSize = 15.sp,
+                            fontWeight = FontWeight.Medium
+                        ),
+                        showFloatingLabel = false
+                    )
+                    CompactSelectField(
+                        text = selectedLocation?.locationName.orEmpty(),
+                        placeholder = if (selectedBuyer == null) "请先选择买家" else "请选择库位",
+                        isError = selectedBuyer != null && selectedLocation == null,
+                        enabled = !isSaving,
+                        onClick = {
+                            if (selectedBuyer == null) {
+                                Toast.makeText(context, "请先选择买家", Toast.LENGTH_SHORT).show()
+                            } else {
+                                showLocationDialog = true
+                            }
+                        },
+                        modifier = Modifier.weight(1f)
+                    )
+                }
+            }
 
+            Card(modifier = Modifier.fillMaxWidth()) {
+                Column(
+                    modifier = Modifier.padding(AppDimens.pagePadding),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
                     when {
-                        selectedBuyer == null -> PreSalePlaceholder("请先选择买家", Icons.Default.PersonOutline)
-                        selectedLocation == null -> PreSalePlaceholder("请先选择库位", Icons.Default.LocationOn)
+                        selectedBuyer == null -> PreSalePlaceholder("请先选择买家")
+                        selectedLocation == null -> PreSalePlaceholder("请先选择库位")
                         else -> {
                             val filtered = productsWithStock.filter { it.availableStock > 0 }
                             if (filtered.isEmpty()) {
-                                PreSalePlaceholder("当前库位暂无库存商品", Icons.Default.Inventory)
+                                PreSalePlaceholder("当前库位暂无库存商品")
                             } else {
                                 LazyColumn(
                                     verticalArrangement = Arrangement.spacedBy(2.dp),
@@ -262,55 +342,83 @@ fun PreSaleOutScreen(viewModel: PreSaleOutViewModel) {
                                 }
 
                                 if (items.isNotEmpty()) {
-                                    Spacer(Modifier.height(16.dp))
-                                    Text(
-                                        "已选择商品 (${items.size}项)",
-                                        style = MaterialTheme.typography.titleSmall,
-                                        color = MaterialTheme.colorScheme.primary
-                                    )
-                                    Spacer(Modifier.height(8.dp))
                                     items.forEach { item ->
                                         Row(
-                                            Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                                            Modifier
+                                                .fillMaxWidth()
+                                                .padding(vertical = 2.dp),
                                             horizontalArrangement = Arrangement.SpaceBetween
                                         ) {
-                                            Text("${item.productName}  ${item.quantity}${item.unit} × ¥${item.salePrice}")
-                                            Text("¥${"%.2f".format(item.amount)}", fontWeight = FontWeight.Medium)
+                                            Text(
+                                                "${item.productName}  ${item.quantity}${item.unit} × ¥${item.salePrice}",
+                                                style = MaterialTheme.typography.bodyMedium
+                                            )
+                                            Text(
+                                                "¥${"%.2f".format(item.amount)}",
+                                                fontWeight = FontWeight.Medium
+                                            )
                                         }
                                     }
                                 }
                             }
                         }
                     }
-                }
-            }
 
-            Card(Modifier.fillMaxWidth()) {
-                Column(Modifier.padding(AppDimens.pagePadding), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                    Text(
-                        "其他信息",
-                        style = MaterialTheme.typography.titleMedium,
-                        color = MaterialTheme.colorScheme.primary
-                    )
-                    OutlinedTextField(
-                        value = selectedOperator?.name ?: "请选择经手人",
-                        onValueChange = {},
-                        readOnly = true,
-                        label = { Text("经手人") },
+                    Divider()
+                    BasicTextField(
+                        value = remark,
+                        onValueChange = { if (!isSaving) viewModel.setRemark(it) },
+                        singleLine = true,
+                        enabled = !isSaving,
+                        textStyle = TextStyle(
+                            fontSize = 14.sp,
+                            color = MaterialTheme.colorScheme.onSurface
+                        ),
+                        cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
                         modifier = Modifier
                             .fillMaxWidth()
-                            .clickable(enabled = !isSaving) { showOperatorDialog = true },
-                        trailingIcon = { Icon(Icons.Default.ArrowDropDown, contentDescription = null) },
-                        enabled = !isSaving
+                            .height(36.dp),
+                        decorationBox = { innerTextField ->
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .clip(MaterialTheme.shapes.small)
+                                    .border(
+                                        1.dp,
+                                        MaterialTheme.colorScheme.outline,
+                                        MaterialTheme.shapes.small
+                                    )
+                                    .padding(horizontal = 10.dp),
+                                contentAlignment = Alignment.CenterStart
+                            ) {
+                                if (remark.isEmpty()) {
+                                    Text(
+                                        "备注（可选）",
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                                innerTextField()
+                            }
+                        }
+                    )
+
+                    CompactSelectField(
+                        text = selectedOperator?.name.orEmpty(),
+                        placeholder = "请选择",
+                        isError = selectedOperator == null,
+                        enabled = !isSaving,
+                        onClick = { showOperatorDialog = true },
+                        modifier = Modifier.fillMaxWidth()
                     )
                 }
             }
 
             Text(
                 if (saleMode == PreSaleMode.PRESALE) {
-                    "预售模式：锁库存，延迟发货，产生应收款"
+                    "预售：锁库存，延迟发货，产生应收"
                 } else {
-                    "出库销售：即时扣减库存，产生应收款"
+                    "出库：即时扣库存，产生应收"
                 },
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
@@ -319,48 +427,38 @@ fun PreSaleOutScreen(viewModel: PreSaleOutViewModel) {
     }
 
     if (showLocationDialog) {
-        PreSaleSelectionDialog("选择库位", locations.map { it.locationName }) { index ->
-            viewModel.selectLocation(locations[index])
-            showLocationDialog = false
-        }
+        LocationSelectorDialog(
+            locations = locations,
+            onDismiss = { showLocationDialog = false },
+            onLocationSelected = {
+                viewModel.selectLocation(it)
+                showLocationDialog = false
+            }
+        )
     }
+
     if (showOperatorDialog) {
-        PreSaleSelectionDialog("选择经手人", operators.map { it.name }) { index ->
-            viewModel.selectOperator(operators[index])
-            showOperatorDialog = false
-        }
+        OperatorSelectorDialog(
+            operators = operators,
+            onDismiss = { showOperatorDialog = false },
+            onOperatorSelected = {
+                viewModel.selectOperator(it)
+                showOperatorDialog = false
+            }
+        )
     }
 }
 
 @Composable
-private fun PreSalePlaceholder(message: String, icon: ImageVector) {
+private fun PreSalePlaceholder(message: String) {
     Box(
-        modifier = Modifier.fillMaxWidth().height(150.dp),
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(48.dp),
         contentAlignment = Alignment.Center
     ) {
-        Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Icon(icon, contentDescription = null, modifier = Modifier.size(48.dp), tint = MaterialTheme.colorScheme.outline)
-            Text(message, color = MaterialTheme.colorScheme.outline)
-        }
+        Text(message, color = MaterialTheme.colorScheme.onSurfaceVariant)
     }
-}
-
-@Composable
-private fun PreSaleSelectionDialog(title: String, options: List<String>, onSelect: (Int) -> Unit) {
-    AlertDialog(
-        onDismissRequest = {},
-        title = { Text(title) },
-        text = {
-            LazyColumn {
-                items(options.size) { i ->
-                    TextButton(onClick = { onSelect(i) }, modifier = Modifier.fillMaxWidth()) {
-                        Text(options[i], modifier = Modifier.fillMaxWidth())
-                    }
-                }
-            }
-        },
-        confirmButton = {}
-    )
 }
 
 @Composable
@@ -370,7 +468,7 @@ private fun PreSalePaymentInputDialog(
     onConfirm: (Double, String) -> Unit
 ) {
     var amount by remember { mutableStateOf("") }
-    var method by remember { mutableStateOf(PayMethod.CASH) }
+    var method by remember { mutableStateOf(PayMethod.WECHAT) }
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("登记收款（可选）") },
@@ -384,7 +482,7 @@ private fun PreSalePaymentInputDialog(
                     modifier = Modifier.fillMaxWidth()
                 )
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    listOf(PayMethod.CASH, PayMethod.TRANSFER, PayMethod.OTHER).forEach { m ->
+                    listOf(PayMethod.WECHAT, PayMethod.TRANSFER, PayMethod.OTHER).forEach { m ->
                         FilterChip(selected = method == m, onClick = { method = m }, label = { Text(m) })
                     }
                 }

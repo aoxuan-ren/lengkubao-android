@@ -5,7 +5,6 @@ import android.os.Bundle
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
-import androidx.lifecycle.lifecycleScope
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -15,13 +14,17 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.pingwei.lengkubao.data.db.AppDatabase
 import com.pingwei.lengkubao.data.db.entity.Customer
 import com.pingwei.lengkubao.data.db.entity.CustomerType
+import com.pingwei.lengkubao.ui.common.rememberDismissKeyboard
 import com.pingwei.lengkubao.ui.theme.LengkubaoTheme
+import com.pingwei.lengkubao.utils.PC_ONLY_CONFIG_DELETE_MESSAGE
+import com.pingwei.lengkubao.utils.SyncTrigger
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
@@ -48,20 +51,12 @@ class BuyerListActivity : ComponentActivity() {
                                 }
                             )
                         },
-                        onDeleteCustomer = { customer ->
-                            lifecycleScope.launch(Dispatchers.IO) {
-                                try {
-                                    AppDatabase.getInstance(this@BuyerListActivity)
-                                        .customerDao().delete(customer)
-                                    withContext(Dispatchers.Main) {
-                                        Toast.makeText(this@BuyerListActivity, "买家已删除", Toast.LENGTH_SHORT).show()
-                                    }
-                                } catch (e: Exception) {
-                                    withContext(Dispatchers.Main) {
-                                        Toast.makeText(this@BuyerListActivity, "删除失败", Toast.LENGTH_SHORT).show()
-                                    }
-                                }
-                            }
+                        onDeleteCustomer = { _ ->
+                            Toast.makeText(
+                                this@BuyerListActivity,
+                                PC_ONLY_CONFIG_DELETE_MESSAGE,
+                                Toast.LENGTH_LONG
+                            ).show()
                         }
                     )
                 }
@@ -78,9 +73,12 @@ fun BuyerListScreen(
     onDeleteCustomer: (Customer) -> Unit
 ) {
     val context = LocalContext.current
+    val coroutineScope = rememberCoroutineScope()
+    val snackbarHostState = remember { SnackbarHostState() }
     var buyers by remember { mutableStateOf<List<Customer>>(emptyList()) }
     var searchQuery by remember { mutableStateOf("") }
     var isLoading by remember { mutableStateOf(true) }
+    val dismissKeyboard = rememberDismissKeyboard()
 
     LaunchedEffect(Unit) {
         val db = AppDatabase.getInstance(context)
@@ -99,6 +97,7 @@ fun BuyerListScreen(
     }
 
     Scaffold(
+        snackbarHost = { SnackbarHost(snackbarHostState) },
         topBar = {
             TopAppBar(
                 title = { Text("买家列表") },
@@ -147,29 +146,129 @@ fun BuyerListScreen(
             } else {
                 LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     items(filtered, key = { it.id }) { buyer ->
-                        Card(modifier = Modifier.fillMaxWidth()) {
-                            Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .padding(12.dp),
-                                horizontalArrangement = Arrangement.SpaceBetween,
-                                verticalAlignment = Alignment.CenterVertically
+                        BuyerListItem(
+                            buyer = buyer,
+                            onToggleEnabled = { enabled ->
+                                dismissKeyboard()
+                                coroutineScope.launch {
+                                    try {
+                                        withContext(Dispatchers.IO) {
+                                            val db = AppDatabase.getInstance(context)
+                                            db.customerDao().updateEnabledStatus(buyer.id, enabled)
+                                            SyncTrigger.triggerCustomerSync(context, buyer.id)
+                                        }
+                                        snackbarHostState.showSnackbar(
+                                            "${buyer.customerName} ${if (enabled) "已启用" else "已禁用"}"
+                                        )
+                                    } catch (e: Exception) {
+                                        snackbarHostState.showSnackbar("操作失败：${e.message ?: "未知错误"}")
+                                    }
+                                }
+                            },
+                            onEdit = {
+                                dismissKeyboard()
+                                onEditCustomer(buyer)
+                            },
+                            onDelete = {
+                                dismissKeyboard()
+                                onDeleteCustomer(buyer)
+                            }
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun BuyerListItem(
+    buyer: Customer,
+    onToggleEnabled: (Boolean) -> Unit,
+    onEdit: () -> Unit,
+    onDelete: () -> Unit,
+) {
+    Card(
+        colors = CardDefaults.cardColors(
+            containerColor = if (buyer.enabled) {
+                MaterialTheme.colorScheme.surface
+            } else {
+                MaterialTheme.colorScheme.surfaceVariant
+            }
+        ),
+        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp),
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(12.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween,
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(
+                            text = buyer.customerName,
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.Bold,
+                            color = if (buyer.enabled) {
+                                MaterialTheme.colorScheme.primary
+                            } else {
+                                Color.Gray
+                            },
+                        )
+                        if (!buyer.enabled) {
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Badge(
+                                containerColor = MaterialTheme.colorScheme.errorContainer,
+                                contentColor = MaterialTheme.colorScheme.onErrorContainer,
                             ) {
-                                Column(modifier = Modifier.weight(1f)) {
-                                    Text(buyer.customerName, fontWeight = FontWeight.Bold)
-                                    Text("${buyer.customerNo}  ${buyer.phone ?: ""}")
-                                }
-                                Row {
-                                    IconButton(onClick = { onEditCustomer(buyer) }) {
-                                        Icon(Icons.Default.Edit, contentDescription = "编辑")
-                                    }
-                                    IconButton(onClick = { onDeleteCustomer(buyer) }) {
-                                        Icon(Icons.Default.Delete, contentDescription = "删除", tint = MaterialTheme.colorScheme.error)
-                                    }
-                                }
+                                Text("已禁用", style = MaterialTheme.typography.labelSmall)
                             }
                         }
                     }
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        text = buildString {
+                            append(buyer.customerNo)
+                            if (!buyer.phone.isNullOrBlank()) {
+                                append("  ")
+                                append(buyer.phone)
+                            }
+                        },
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                Switch(
+                    checked = buyer.enabled,
+                    onCheckedChange = onToggleEnabled,
+                )
+            }
+            Spacer(modifier = Modifier.height(8.dp))
+            Row(
+                horizontalArrangement = Arrangement.End,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                TextButton(onClick = onEdit) {
+                    Icon(Icons.Default.Edit, contentDescription = "编辑", modifier = Modifier.size(16.dp))
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text("编辑")
+                }
+                Spacer(modifier = Modifier.width(8.dp))
+                TextButton(
+                    onClick = onDelete,
+                    colors = ButtonDefaults.textButtonColors(
+                        contentColor = MaterialTheme.colorScheme.error
+                    ),
+                ) {
+                    Icon(Icons.Default.Delete, contentDescription = "删除", modifier = Modifier.size(16.dp))
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text("删除")
                 }
             }
         }

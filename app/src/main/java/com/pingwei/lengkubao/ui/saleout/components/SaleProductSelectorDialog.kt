@@ -26,6 +26,7 @@ import kotlinx.coroutines.launch
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.pingwei.lengkubao.ui.saleout.viewmodel.SaleOutViewModel
 import com.pingwei.lengkubao.ui.theme.AppDimens
+import com.pingwei.lengkubao.ui.common.rememberDismissKeyboard
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -48,6 +49,7 @@ fun SaleProductSelectorDialog(
     var priceError by remember { mutableStateOf(false) }
     var quantityError by remember { mutableStateOf(false) }
     var searchQuery by remember { mutableStateOf("") }
+    val dismissKeyboard = rememberDismissKeyboard()
 
     // 过滤后的商品列表
     val filteredProducts = remember(productsWithStock, searchQuery) {
@@ -184,6 +186,7 @@ fun SaleProductSelectorDialog(
                                     productWithStock = productWithStock,
                                     selected = selectedProduct?.product?.id == productWithStock.product.id,
                                     onClick = {
+                                        dismissKeyboard()
                                         selectedProduct = productWithStock
                                         // 选中商品时自动填充默认价格（使用standardPrice字段）
                                         if (salePrice.isEmpty()) {

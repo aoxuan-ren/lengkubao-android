@@ -3,6 +3,7 @@ package com.pingwei.lengkubao.ui.saleout
 
 import android.content.ContentValues.TAG
 import android.content.Context
+import android.content.Intent
 import android.os.Bundle
 import android.util.Log
 import android.widget.Toast
@@ -10,6 +11,7 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
@@ -19,6 +21,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -34,6 +37,7 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
@@ -42,6 +46,7 @@ import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
 import com.pingwei.lengkubao.data.db.AppDatabase
 import com.pingwei.lengkubao.data.db.entity.Customer
+import com.pingwei.lengkubao.data.db.entity.CustomerType
 import com.pingwei.lengkubao.data.db.entity.Location
 import com.pingwei.lengkubao.data.db.entity.Operator
 import com.pingwei.lengkubao.data.db.entity.SaleItem
@@ -49,6 +54,8 @@ import com.pingwei.lengkubao.data.model.ProductWithStock
 import com.pingwei.lengkubao.service.TcpSyncService
 import com.pingwei.lengkubao.sync.TcpSyncManager
 import com.pingwei.lengkubao.ui.common.ProductQuantityPriceInput
+import com.pingwei.lengkubao.ui.customer.CustomerAddActivity
+import com.pingwei.lengkubao.ui.instock.components.CompactSelectField
 import com.pingwei.lengkubao.ui.instock.components.LocationSelectorDialog
 import com.pingwei.lengkubao.ui.instock.components.OperatorSelectorDialog
 import com.pingwei.lengkubao.ui.instock.components.SearchableCustomerField
@@ -422,7 +429,7 @@ fun SaleOutScreen(
             onDismiss = { showOperatorDialog = false },
             onOperatorSelected = {
                 viewModel.selectOperator(it)
-                viewModel.saveAsDefaultHandler() // 选择后自动保存为默认
+                viewModel.saveAsDefaultHandler()
                 showOperatorDialog = false
             }
         )
@@ -545,6 +552,25 @@ fun SaleOutScreen(
                         horizontalArrangement = Arrangement.Center
                     ) {
                         Text("客户报账")
+                        IconButton(
+                            onClick = {
+                                context.startActivity(
+                                    Intent(context, CustomerAddActivity::class.java).apply {
+                                        putExtra(
+                                            CustomerAddActivity.EXTRA_CUSTOMER_TYPE,
+                                            CustomerType.SELLER
+                                        )
+                                    }
+                                )
+                            },
+                            modifier = Modifier.size(32.dp)
+                        ) {
+                            Icon(
+                                Icons.Default.Add,
+                                contentDescription = "添加卖家客户",
+                                modifier = Modifier.size(20.dp)
+                            )
+                        }
 
                         if (isScanning) {
                             Spacer(modifier = Modifier.width(8.dp))
@@ -638,22 +664,12 @@ fun SaleOutScreen(
                         .padding(AppDimens.pagePadding),
                     verticalArrangement = Arrangement.spacedBy(AppDimens.sectionSpacing)
                 ) {
-                    // 客户信息卡片
-                    Card(
-                        modifier = Modifier.fillMaxWidth(),
-                        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
-                    ) {
+                    // 1. 客户 + 库位（无标题；经手人不挪到此处）
+                    Card(modifier = Modifier.fillMaxWidth()) {
                         Column(
                             modifier = Modifier.padding(AppDimens.pagePadding),
                             verticalArrangement = Arrangement.spacedBy(12.dp)
                         ) {
-                            Text(
-                                text = "销售信息",
-                                style = MaterialTheme.typography.titleMedium,
-                                color = MaterialTheme.colorScheme.primary
-                            )
-
-                            // 客户选择 - 支持扫码和列表两种方式
                             Row(
                                 modifier = Modifier.fillMaxWidth(),
                                 horizontalArrangement = Arrangement.spacedBy(AppDimens.itemSpacing),
@@ -668,24 +684,29 @@ fun SaleOutScreen(
                                         }
                                     },
                                     modifier = Modifier.weight(1f),
-                                    isError = selectedCustomer == null
+                                    isError = selectedCustomer == null,
+                                    fieldHeight = 40.dp,
+                                    fieldTextStyle = MaterialTheme.typography.bodyMedium.copy(
+                                        fontSize = 15.sp,
+                                        fontWeight = FontWeight.Medium
+                                    ),
+                                    showFloatingLabel = false
                                 )
 
-                                // 扫码按钮
                                 IconButton(
                                     onClick = {
                                         if (!isSaving) {
                                             onScanCustomer()
                                         }
                                     },
-                                    modifier = Modifier.size(56.dp),
+                                    modifier = Modifier.size(48.dp),
                                     enabled = !isSaving
                                 ) {
                                     Column(horizontalAlignment = Alignment.CenterHorizontally) {
                                         Icon(
                                             Icons.Default.QrCodeScanner,
                                             contentDescription = "扫码选择",
-                                            Modifier.size(28.dp)
+                                            Modifier.size(26.dp)
                                         )
                                         Text(
                                             "扫码",
@@ -696,163 +717,57 @@ fun SaleOutScreen(
                                 }
                             }
 
-                            // 库位选择（需在客户之后）
-                            Box(modifier = Modifier.fillMaxWidth()) {
-                                OutlinedTextField(
-                                    value = when {
-                                        selectedCustomer == null -> "请先选择客户"
-                                        selectedLocation != null -> "${selectedLocation!!.locationName} (${selectedLocation!!.locationNo})"
-                                        else -> "请选择库位"
-                                    },
-                                    onValueChange = {},
-                                    label = { Text("库位") },
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .clickable(
-                                            enabled = !isSaving && selectedCustomer != null,
-                                            onClick = {
-                                                if (selectedCustomer == null) {
-                                                    Toast.makeText(
-                                                        context,
-                                                        "⚠️ 请先选择客户",
-                                                        Toast.LENGTH_SHORT
-                                                    ).show()
-                                                } else {
-                                                    showLocationDialog = true
-                                                }
-                                            }
-                                        ),
-                                    readOnly = true,
-                                    leadingIcon = {
-                                        Icon(
-                                            Icons.Default.LocationOn,
-                                            contentDescription = "库位"
-                                        )
-                                    },
-                                    trailingIcon = {
-                                        Row {
-                                            if (selectedLocation?.id == viewModel.getDefaultLocationId()) {
-                                                Icon(
-                                                    Icons.Default.Star,
-                                                    contentDescription = "默认库位",
-                                                    tint = MaterialTheme.colorScheme.primary,
-                                                    modifier = Modifier.size(20.dp)
-                                                )
-                                                Spacer(modifier = Modifier.width(4.dp))
-                                            }
-                                            IconButton(
-                                                onClick = {
-                                                    if (selectedCustomer == null) {
-                                                        Toast.makeText(
-                                                            context,
-                                                            "⚠️ 请先选择客户",
-                                                            Toast.LENGTH_SHORT
-                                                        ).show()
-                                                    } else {
-                                                        showLocationDialog = true
-                                                    }
-                                                },
-                                                enabled = !isSaving && selectedCustomer != null
-                                            ) {
-                                                Icon(
-                                                    Icons.Default.ArrowDropDown,
-                                                    contentDescription = "选择库位"
-                                                )
-                                            }
-                                        }
-                                    },
-                                    isError = selectedCustomer != null && selectedLocation == null,
-                                    enabled = !isSaving && selectedCustomer != null
-                                )
-                            }
+                            CompactSelectField(
+                                text = selectedLocation?.locationName.orEmpty(),
+                                placeholder = if (selectedCustomer == null) "请先选择客户" else "请选择库位",
+                                isError = selectedCustomer != null && selectedLocation == null,
+                                showDefaultStar = selectedLocation?.id == viewModel.getDefaultLocationId(),
+                                enabled = !isSaving,
+                                onClick = {
+                                    if (selectedCustomer == null) {
+                                        Toast.makeText(
+                                            context,
+                                            "⚠️ 请先选择客户",
+                                            Toast.LENGTH_SHORT
+                                        ).show()
+                                    } else {
+                                        showLocationDialog = true
+                                    }
+                                },
+                                modifier = Modifier.fillMaxWidth()
+                            )
                         }
                     }
 
-                    // 销售商品明细卡片
-                    Card(
-                        modifier = Modifier.fillMaxWidth(),
-                        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
-                    ) {
+                    // 2. 商品明细 + 备注 + 经手人（无分区标题）
+                    Card(modifier = Modifier.fillMaxWidth()) {
                         Column(
-                            modifier = Modifier.padding(AppDimens.pagePadding)
+                            modifier = Modifier.padding(AppDimens.pagePadding),
+                            verticalArrangement = Arrangement.spacedBy(8.dp)
                         ) {
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.SpaceBetween,
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Text(
-                                    text = "销售商品明细",
-                                    style = MaterialTheme.typography.titleMedium
-                                )
-
-                                // 显示已选商品数量
-                                Text(
-                                    text = "已选: ${saleItems.size} 种",
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.primary
-                                )
-                            }
-
-                            Spacer(modifier = Modifier.height(12.dp))
-
                             if (selectedCustomer == null) {
                                 Box(
                                     modifier = Modifier
                                         .fillMaxWidth()
-                                        .height(150.dp),
+                                        .height(48.dp),
                                     contentAlignment = Alignment.Center
                                 ) {
-                                    Column(
-                                        horizontalAlignment = Alignment.CenterHorizontally,
-                                        verticalArrangement = Arrangement.spacedBy(AppDimens.itemSpacing)
-                                    ) {
-                                        Icon(
-                                            Icons.Default.PersonOutline,
-                                            contentDescription = "选择客户",
-                                            modifier = Modifier.size(48.dp),
-                                            tint = MaterialTheme.colorScheme.outline
-                                        )
-                                        Text(
-                                            "请先选择客户",
-                                            style = MaterialTheme.typography.bodyMedium,
-                                            color = MaterialTheme.colorScheme.outline
-                                        )
-                                        Text(
-                                            "选择客户后，再选择库位和商品明细",
-                                            style = MaterialTheme.typography.bodySmall,
-                                            color = MaterialTheme.colorScheme.outline.copy(alpha = 0.7f)
-                                        )
-                                    }
+                                    Text(
+                                        "请先选择客户",
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
                                 }
                             } else if (selectedLocation == null) {
                                 Box(
                                     modifier = Modifier
                                         .fillMaxWidth()
-                                        .height(150.dp),
+                                        .height(48.dp),
                                     contentAlignment = Alignment.Center
                                 ) {
-                                    Column(
-                                        horizontalAlignment = Alignment.CenterHorizontally,
-                                        verticalArrangement = Arrangement.spacedBy(AppDimens.itemSpacing)
-                                    ) {
-                                        Icon(
-                                            Icons.Default.LocationOn,
-                                            contentDescription = "选择库位",
-                                            modifier = Modifier.size(48.dp),
-                                            tint = MaterialTheme.colorScheme.outline
-                                        )
-                                        Text(
-                                            "请先选择库位",
-                                            style = MaterialTheme.typography.bodyMedium,
-                                            color = MaterialTheme.colorScheme.outline
-                                        )
-                                        Text(
-                                            "选择库位后，将自动加载该库位的商品库存",
-                                            style = MaterialTheme.typography.bodySmall,
-                                            color = MaterialTheme.colorScheme.outline.copy(alpha = 0.7f)
-                                        )
-                                    }
+                                    Text(
+                                        "请先选择库位",
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
                                 }
                             } else if (productsWithStock.isEmpty()) {
                                 EmptySaleItemsPlaceholder(
@@ -865,7 +780,6 @@ fun SaleOutScreen(
                                     }
                                 )
                             } else {
-                                // 只显示有库存的商品
                                 val filteredProducts =
                                     productsWithStock.filter { productWithStock ->
                                         productWithStock.availableStock > 0
@@ -875,30 +789,13 @@ fun SaleOutScreen(
                                     Box(
                                         modifier = Modifier
                                             .fillMaxWidth()
-                                            .height(150.dp),
+                                            .height(48.dp),
                                         contentAlignment = Alignment.Center
                                     ) {
-                                        Column(
-                                            horizontalAlignment = Alignment.CenterHorizontally,
-                                            verticalArrangement = Arrangement.spacedBy(AppDimens.itemSpacing)
-                                        ) {
-                                            Icon(
-                                                Icons.Default.Inventory,
-                                                contentDescription = "无库存商品",
-                                                modifier = Modifier.size(48.dp),
-                                                tint = MaterialTheme.colorScheme.outline
-                                            )
-                                            Text(
-                                                "当前库位暂无库存商品",
-                                                style = MaterialTheme.typography.bodyMedium,
-                                                color = MaterialTheme.colorScheme.outline
-                                            )
-                                            Text(
-                                                "请先入库或选择其他库位",
-                                                style = MaterialTheme.typography.bodySmall,
-                                                color = MaterialTheme.colorScheme.outline.copy(alpha = 0.7f)
-                                            )
-                                        }
+                                        Text(
+                                            "当前库位暂无可报账商品",
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                                        )
                                     }
                                 } else {
                                     LazyColumn(
@@ -906,11 +803,11 @@ fun SaleOutScreen(
                                         modifier = Modifier.heightIn(max = 400.dp)
                                     ) {
                                         items(filteredProducts) { productWithStock ->
-                                            // 使用优化后的单价输入组件
                                             ProductQuantityPriceInput(
                                                 productWithStock = productWithStock,
                                                 existingQuantity = saleItems.find { it.productId == productWithStock.product.id }?.quantity ?: 0,
                                                 existingPrice = saleItems.find { it.productId == productWithStock.product.id }?.salePrice ?: 0.0,
+                                                stockLabel = "可报账",
                                                 onQuantityChange = { quantity, price ->
                                                     coroutineScope.launch {
                                                         if (quantity > 0) {
@@ -937,7 +834,6 @@ fun SaleOutScreen(
                                                                 ).show()
                                                             }
                                                         } else {
-                                                            // 如果数量为0，从列表中移除该商品
                                                             val index = saleItems.indexOfFirst {
                                                                 it.productId == productWithStock.product.id
                                                             }
@@ -952,18 +848,7 @@ fun SaleOutScreen(
                                         }
                                     }
 
-                                    Spacer(modifier = Modifier.height(16.dp))
-
-                                    // 已选择的商品列表
                                     if (saleItems.isNotEmpty()) {
-                                        Text(
-                                            text = "已选择商品 (${saleItems.size}项)",
-                                            style = MaterialTheme.typography.titleSmall,
-                                            color = MaterialTheme.colorScheme.primary
-                                        )
-
-                                        Spacer(modifier = Modifier.height(8.dp))
-
                                         LazyColumn(
                                             verticalArrangement = Arrangement.spacedBy(2.dp),
                                             modifier = Modifier.heightIn(max = 200.dp)
@@ -983,8 +868,6 @@ fun SaleOutScreen(
                                             }
                                         }
 
-                                        Spacer(modifier = Modifier.height(16.dp))
-
                                         SaleSummaryInfo(
                                             totalQuantity = totalQuantity.toDouble(),
                                             totalAmount = totalAmount
@@ -992,99 +875,54 @@ fun SaleOutScreen(
                                     }
                                 }
                             }
-                        }
-                    }
 
-                    // 库位和经手人卡片
-                    Card(
-                        modifier = Modifier.fillMaxWidth(),
-                        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
-                    ) {
-                        Column(
-                            modifier = Modifier.padding(AppDimens.pagePadding),
-                            verticalArrangement = Arrangement.spacedBy(12.dp)
-                        ) {
-                            Text(
-                                text = "其他信息",
-                                style = MaterialTheme.typography.titleMedium,
-                                color = MaterialTheme.colorScheme.primary
-                            )
-
-                            // 经手人选择 - 添加默认值星标
-                            Box(modifier = Modifier.fillMaxWidth()) {
-                                OutlinedTextField(
-                                    value = selectedOperator?.name ?: "请选择经手人",
-                                    onValueChange = {},
-                                    label = { Text("经手人") },
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .clickable(
-                                            enabled = !isSaving,
-                                            onClick = { showOperatorDialog = true }
-                                        ),
-                                    readOnly = true,
-                                    leadingIcon = {
-                                        Icon(
-                                            Icons.Default.PersonOutline,
-                                            contentDescription = "经手人"
-                                        )
-                                    },
-                                    trailingIcon = {
-                                        Row {
-                                            // 默认值星标
-                                            if (selectedOperator?.id == viewModel.getDefaultHandlerId()) {
-                                                Icon(
-                                                    Icons.Default.Star,
-                                                    contentDescription = "默认经手人",
-                                                    tint = MaterialTheme.colorScheme.primary,
-                                                    modifier = Modifier.size(20.dp)
-                                                )
-                                                Spacer(modifier = Modifier.width(4.dp))
-                                            }
-                                            IconButton(
-                                                onClick = { showOperatorDialog = true },
-                                                enabled = !isSaving
-                                            ) {
-                                                Icon(
-                                                    Icons.Default.ArrowDropDown,
-                                                    contentDescription = "选择经手人"
-                                                )
-                                            }
-                                        }
-                                    },
-                                    isError = selectedOperator == null,
-                                    enabled = !isSaving
-                                )
-                            }
-                        }
-                    }
-
-                    // 备注信息卡片放在最下面
-                    Card(
-                        modifier = Modifier.fillMaxWidth(),
-                        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
-                    ) {
-                        Column(
-                            modifier = Modifier.padding(AppDimens.pagePadding)
-                        ) {
-                            Text(
-                                text = "备注信息",
-                                style = MaterialTheme.typography.titleMedium,
-                                color = MaterialTheme.colorScheme.primary
-                            )
-
-                            Spacer(modifier = Modifier.height(8.dp))
-
-                            OutlinedTextField(
+                            Divider()
+                            BasicTextField(
                                 value = remark,
                                 onValueChange = { if (!isSaving) viewModel.setRemark(it) },
-                                label = { Text("请输入备注信息（可选）") },
-                                modifier = Modifier.fillMaxWidth(),
-                                maxLines = 3,
+                                singleLine = true,
                                 enabled = !isSaving,
-                                colors = OutlinedTextFieldDefaults.colors(
-                                    focusedBorderColor = MaterialTheme.colorScheme.primary
-                                )
+                                textStyle = TextStyle(
+                                    fontSize = 14.sp,
+                                    color = MaterialTheme.colorScheme.onSurface
+                                ),
+                                cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(36.dp),
+                                decorationBox = { innerTextField ->
+                                    Box(
+                                        modifier = Modifier
+                                            .fillMaxSize()
+                                            .clip(MaterialTheme.shapes.small)
+                                            .border(
+                                                1.dp,
+                                                MaterialTheme.colorScheme.outline,
+                                                MaterialTheme.shapes.small
+                                            )
+                                            .padding(horizontal = 10.dp),
+                                        contentAlignment = Alignment.CenterStart
+                                    ) {
+                                        if (remark.isEmpty()) {
+                                            Text(
+                                                "备注（可选）",
+                                                style = MaterialTheme.typography.bodyMedium,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                                            )
+                                        }
+                                        innerTextField()
+                                    }
+                                }
+                            )
+
+                            CompactSelectField(
+                                text = selectedOperator?.name.orEmpty(),
+                                placeholder = "请选择",
+                                isError = selectedOperator == null,
+                                showDefaultStar = selectedOperator?.id == viewModel.getDefaultHandlerId(),
+                                enabled = !isSaving,
+                                onClick = { showOperatorDialog = true },
+                                modifier = Modifier.fillMaxWidth()
                             )
                         }
                     }

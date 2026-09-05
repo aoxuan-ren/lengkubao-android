@@ -26,8 +26,12 @@ import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
 import com.pingwei.lengkubao.data.db.AppDatabase
 import com.pingwei.lengkubao.data.db.entity.Customer
+import com.pingwei.lengkubao.data.db.entity.CustomerType
+import com.pingwei.lengkubao.ui.common.rememberDismissKeyboard
 import com.pingwei.lengkubao.ui.customer.utils.QRCodeGenerator
 import com.pingwei.lengkubao.ui.theme.LengkubaoTheme
+import com.pingwei.lengkubao.utils.CustomerSearchFilter
+import com.pingwei.lengkubao.utils.SyncTrigger
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
@@ -63,10 +67,8 @@ class CustomerListActivity : ComponentActivity() {
                 }
 
                 val db = AppDatabase.getInstance(this@CustomerListActivity)
-                val allCustomers = db.customerDao().getAllCustomersSync()
-
-                // 查找匹配的客户
-                val customer = allCustomers.find { it.customerNo == customerNo }
+                val customer = db.customerDao().getByCustomerNo(customerNo)
+                    ?.takeIf { it.customerType == CustomerType.SELLER }
 
                 withContext(Dispatchers.Main) {
                     if (customer != null) {
@@ -147,37 +149,13 @@ class CustomerListActivity : ComponentActivity() {
         startActivity(intent)
     }
 
-    // 删除客户 - 修复线程问题
+    // 删除客户 - 以电脑端为准
     private fun deleteCustomer(customer: Customer) {
-        lifecycleScope.launch(Dispatchers.IO) {
-            try {
-                val db = AppDatabase.getInstance(this@CustomerListActivity)
-
-                // 先删除二维码文件（如果存在）
-                customer.qrCodePath?.let { path ->
-                    QRCodeGenerator.deleteQRCodeFile(path)
-                }
-
-                // 删除数据库记录
-                db.customerDao().delete(customer)
-
-                withContext(Dispatchers.Main) {
-                    Toast.makeText(
-                        this@CustomerListActivity,
-                        "客户 ${customer.customerName} 已删除",
-                        Toast.LENGTH_SHORT
-                    ).show()
-                }
-            } catch (e: Exception) {
-                withContext(Dispatchers.Main) {
-                    Toast.makeText(
-                        this@CustomerListActivity,
-                        "删除失败: ${e.message}",
-                        Toast.LENGTH_SHORT
-                    ).show()
-                }
-            }
-        }
+        Toast.makeText(
+            this@CustomerListActivity,
+            com.pingwei.lengkubao.utils.PC_ONLY_CONFIG_DELETE_MESSAGE,
+            Toast.LENGTH_LONG
+        ).show()
     }
 
     // 编辑客户
@@ -229,6 +207,11 @@ fun CustomerListScreen(
     var customers by remember { mutableStateOf<List<Customer>>(emptyList()) }
     var searchQuery by remember { mutableStateOf("") }
     var isLoading by remember { mutableStateOf(true) }
+    val dismissKeyboard = rememberDismissKeyboard()
+
+    val filteredCustomers = remember(customers, searchQuery) {
+        CustomerSearchFilter.filter(customers, searchQuery)
+    }
 
     // 使用Flow加载客户数据 - 修复：正确处理协程
     LaunchedEffect(Unit) {
@@ -239,7 +222,7 @@ fun CustomerListScreen(
             coroutineScope.launch(Dispatchers.IO) {
                 try {
                     // 方法1：使用Flow监听数据变化
-                    db.customerDao().getAllCustomers().collectLatest { customerList ->
+                    db.customerDao().getCustomersByType(CustomerType.SELLER).collectLatest { customerList ->
                         withContext(Dispatchers.Main) {
                             customers = customerList
                             isLoading = false
@@ -249,7 +232,7 @@ fun CustomerListScreen(
                     e.printStackTrace()
                     // 方法2：如果Flow失败，使用同步方法
                     try {
-                        val customerList = db.customerDao().getAllCustomersSync()
+                        val customerList = db.customerDao().getCustomersByTypeSync(CustomerType.SELLER)
                         withContext(Dispatchers.Main) {
                             customers = customerList
                             isLoading = false
@@ -329,7 +312,7 @@ fun CustomerListScreen(
                         value = searchQuery,
                         onValueChange = { searchQuery = it },
                         modifier = Modifier.weight(1f),
-                        placeholder = { Text("搜索客户编号或姓名") },
+                        placeholder = { Text(CustomerSearchFilter.PLACEHOLDER) },
                         colors = TextFieldDefaults.colors(
                             focusedContainerColor = Color.Transparent,
                             unfocusedContainerColor = Color.Transparent,
@@ -386,51 +369,45 @@ fun CustomerListScreen(
                         }
                     }
                 }
-            } else {
-                val filteredCustomers = if (searchQuery.isBlank()) {
-                    customers
-                } else {
-                    customers.filter { customer ->
-                        customer.customerNo.contains(searchQuery, ignoreCase = true) ||
-                                customer.customerName?.contains(searchQuery, ignoreCase = true) == true ||
-                                (customer.phone?.contains(searchQuery, ignoreCase = true) == true)
-                    }
+            } else if (filteredCustomers.isEmpty()) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .padding(16.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        text = "未找到相关客户",
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
                 }
-
-                if (filteredCustomers.isEmpty()) {
-                    Box(
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .padding(16.dp),
-                        contentAlignment = Alignment.Center
-                    ) {
+            } else {
+                LazyColumn(
+                    modifier = Modifier.fillMaxSize(),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                    contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp)
+                ) {
+                    item {
                         Text(
-                            text = "未找到匹配的客户",
+                            text = "共 ${filteredCustomers.size} 个客户",
+                            modifier = Modifier.padding(vertical = 8.dp),
+                            fontSize = 12.sp,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
                     }
-                } else {
-                    LazyColumn(
-                        modifier = Modifier.fillMaxSize(),
-                        verticalArrangement = Arrangement.spacedBy(8.dp),
-                        contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp)
-                    ) {
-                        item {
-                            Text(
-                                text = "共 ${filteredCustomers.size} 个客户",
-                                modifier = Modifier.padding(vertical = 8.dp),
-                                fontSize = 12.sp,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
-                        }
 
-                        items(filteredCustomers) { customer ->
-                            CustomerItem(
-                                customer = customer,
-                                onClick = { onEditCustomer(customer) },
-                                onDelete = { onDeleteCustomer(customer) }
-                            )
-                        }
+                    items(filteredCustomers, key = { it.id }) { customer ->
+                        CustomerItem(
+                            customer = customer,
+                            onClick = {
+                                dismissKeyboard()
+                                onEditCustomer(customer)
+                            },
+                            onDelete = {
+                                dismissKeyboard()
+                                onDeleteCustomer(customer)
+                            }
+                        )
                     }
                 }
             }

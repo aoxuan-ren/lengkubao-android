@@ -72,6 +72,9 @@ interface AdvanceDao {
     @Query("SELECT SUM(amount) FROM advances WHERE status = 1")
     suspend fun getTotalAllAdvances(): Double?
 
+    @Query("SELECT * FROM advances WHERE create_time BETWEEN :startTime AND :endTime ORDER BY create_time DESC, id DESC")
+    suspend fun getByCreateTimeRange(startTime: Long, endTime: Long): List<Advance>
+
     @Query("UPDATE advances SET sync_status = 0, sync_time = NULL WHERE create_time BETWEEN :startTime AND :endTime")
     suspend fun resetSyncStatusByCreateTimeRange(startTime: Long, endTime: Long): Int
 }

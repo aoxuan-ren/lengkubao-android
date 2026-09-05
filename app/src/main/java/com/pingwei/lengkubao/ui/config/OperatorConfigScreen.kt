@@ -1,73 +1,69 @@
-// ui/config/OperatorConfigScreen.kt (完整版)
 package com.pingwei.lengkubao.ui.config
 
 import android.app.Application
+import android.widget.Toast
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
-import androidx.compose.ui.ExperimentalComposeUiApi
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.focus.FocusRequester
-import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalSoftwareKeyboardController
-import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.lifecycle.viewmodel.compose.viewModel
+import androidx.navigation.NavController
+import com.pingwei.lengkubao.data.db.AppDatabase
 import com.pingwei.lengkubao.data.db.entity.Operator
+import com.pingwei.lengkubao.ui.common.rememberDismissKeyboard
+import com.pingwei.lengkubao.utils.ConfigDeleteResult
+import com.pingwei.lengkubao.utils.ConfigNameSearchFilter
+import com.pingwei.lengkubao.utils.PC_ONLY_CONFIG_DELETE_MESSAGE
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
-@OptIn(ExperimentalMaterial3Api::class, ExperimentalComposeUiApi::class)
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun OperatorConfigScreen(
-    onBack: () -> Unit = {}
+    navController: NavController,
+    snackbarHostState: SnackbarHostState,
 ) {
     val context = LocalContext.current
     val viewModel: OperatorConfigViewModel = viewModel(
         factory = OperatorConfigViewModelFactory(context.applicationContext as Application)
     )
-    val snackbarHostState = remember { SnackbarHostState() }
     val coroutineScope = rememberCoroutineScope()
 
-    // 监听视图模型状态
     val operators by viewModel.operators.collectAsState(initial = emptyList())
-    val searchResults by viewModel.searchResults.collectAsState(initial = emptyList())
     val isLoading by viewModel.isLoading.collectAsState()
-    val searchText by viewModel.searchText.collectAsState()
+    var searchQuery by remember { mutableStateOf("") }
 
-    // 控制对话框显示
-    var showAddDialog by remember { mutableStateOf(false) }
-    var showEditDialog by remember { mutableStateOf(false) }
     var showDeleteDialog by remember { mutableStateOf(false) }
     var selectedOperator by remember { mutableStateOf<Operator?>(null) }
+    val dismissKeyboard = rememberDismissKeyboard()
+
+    val displayList = remember(operators, searchQuery) {
+        ConfigNameSearchFilter.filter(operators, searchQuery) { it.name }
+    }
 
     Scaffold(
         snackbarHost = { SnackbarHost(hostState = snackbarHostState) },
         topBar = {
             CenterAlignedTopAppBar(
                 title = { Text("经手人管理") },
-                navigationIcon = {
-                    IconButton(onClick = onBack) {
-                        Icon(Icons.Filled.ArrowBack, "返回")
-                    }
-                },
                 actions = {
-                    // 只保留添加经手人按钮，删除了初始化默认经手人按钮
-                    IconButton(
-                        onClick = { showAddDialog = true }
-                    ) {
+                    IconButton(onClick = { navController.navigate("operator_add") }) {
                         Icon(Icons.Filled.AddCircle, "添加经手人")
                     }
                 }
@@ -83,37 +79,11 @@ fun OperatorConfigScreen(
                 modifier = Modifier.fillMaxSize(),
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
-                // 搜索框
-                OutlinedTextField(
-                    value = searchText,
-                    onValueChange = { viewModel.searchOperators(it) },
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 16.dp, vertical = 8.dp),
-                    placeholder = { Text("搜索经手人姓名或编号...") },
-                    leadingIcon = { Icon(Icons.Filled.Search, "搜索") },
-                    trailingIcon = {
-                        if (searchText.isNotEmpty()) {
-                            IconButton(
-                                onClick = { viewModel.clearSearch() }
-                            ) {
-                                Icon(Icons.Filled.Clear, "清空")
-                            }
-                        }
-                    },
-                    singleLine = true,
-                    shape = MaterialTheme.shapes.medium,
-                    keyboardOptions = KeyboardOptions(
-                        imeAction = ImeAction.Search
-                    ),
-                    keyboardActions = KeyboardActions(
-                        onSearch = {
-                            // 搜索逻辑已经在onValueChange中处理
-                        }
-                    )
+                ConfigSearchBar(
+                    value = searchQuery,
+                    onValueChange = { searchQuery = it },
                 )
 
-                // 经手人列表
                 if (isLoading) {
                     Box(
                         modifier = Modifier.fillMaxSize(),
@@ -122,8 +92,6 @@ fun OperatorConfigScreen(
                         CircularProgressIndicator()
                     }
                 } else {
-                    val displayList = if (searchText.isNotEmpty()) searchResults else operators
-
                     if (displayList.isEmpty()) {
                         Box(
                             modifier = Modifier.fillMaxSize(),
@@ -139,7 +107,7 @@ fun OperatorConfigScreen(
                                     modifier = Modifier.size(48.dp)
                                 )
                                 Text("暂无经手人数据")
-                                if (searchText.isNotEmpty()) {
+                                if (searchQuery.isNotEmpty()) {
                                     Text("尝试其他关键词或清空搜索", style = MaterialTheme.typography.bodySmall)
                                 } else {
                                     Text("点击右上角 + 按钮添加经手人", style = MaterialTheme.typography.bodySmall)
@@ -155,20 +123,20 @@ fun OperatorConfigScreen(
                                 OperatorItem(
                                     operator = operator,
                                     onEdit = {
-                                        selectedOperator = operator
-                                        showEditDialog = true
+                                        dismissKeyboard()
+                                        navController.navigate("operator_edit/${operator.id}")
                                     },
                                     onDelete = {
+                                        dismissKeyboard()
                                         selectedOperator = operator
                                         showDeleteDialog = true
                                     },
                                     onToggleEnabled = {
+                                        dismissKeyboard()
                                         coroutineScope.launch {
                                             viewModel.toggleOperatorEnabled(operator)
                                             val status = if (operator.enabled) "禁用" else "启用"
-                                            snackbarHostState.showSnackbar(
-                                                "已${status} ${operator.name}"
-                                            )
+                                            snackbarHostState.showSnackbar("已${status} ${operator.name}")
                                         }
                                     }
                                 )
@@ -179,90 +147,229 @@ fun OperatorConfigScreen(
             }
         }
 
-        // 添加经手人对话框
-        if (showAddDialog) {
-            AddOperatorDialog(
-                onDismiss = { showAddDialog = false },
-                onConfirm = { operatorNo, name, phone, role, remark ->
-                    coroutineScope.launch {
-                        val success = viewModel.addOperator(
-                            operatorNo = operatorNo,
-                            name = name,
-                            phone = phone,
-                            role = role,
-                            remark = remark
-                        )
-                        if (success) {
-                            snackbarHostState.showSnackbar(
-                                "添加经手人成功"
-                            )
-                        } else {
-                            snackbarHostState.showSnackbar(
-                                "经手人编号已存在"
-                            )
-                        }
-                        showAddDialog = false
-                    }
-                }
-            )
-        }
-
-        // 编辑经手人对话框
-        if (showEditDialog && selectedOperator != null) {
-            EditOperatorDialog(
-                operator = selectedOperator!!,
-                onDismiss = { showEditDialog = false },
-                onConfirm = { operatorNo, name, phone, role, remark ->
-                    coroutineScope.launch {
-                        viewModel.updateOperator(
-                            operator = selectedOperator!!.copy(
-                                operatorNo = operatorNo,
-                                name = name,
-                                phone = phone,
-                                role = role,
-                                remark = remark
-                            )
-                        )
-                        snackbarHostState.showSnackbar(
-                            "更新经手人成功"
-                        )
-                        showEditDialog = false
-                    }
-                }
-            )
-        }
-
-        // 删除确认对话框
         if (showDeleteDialog && selectedOperator != null) {
+            var refCount by remember(selectedOperator!!.id) { mutableIntStateOf(-1) }
+            LaunchedEffect(selectedOperator!!.id) {
+                refCount = viewModel.countOperatorBillRefs(selectedOperator!!.id)
+            }
+            val operator = selectedOperator!!
             AlertDialog(
-                onDismissRequest = { showDeleteDialog = false },
+                onDismissRequest = {
+                    showDeleteDialog = false
+                    selectedOperator = null
+                },
                 title = { Text("确认删除") },
                 text = {
-                    Text("确定要删除经手人 ${selectedOperator!!.name} (${selectedOperator!!.operatorNo}) 吗？此操作不可恢复。")
+                    when {
+                        refCount < 0 -> Text("正在检查单据引用…")
+                        refCount > 0 -> Text(
+                            "经手人 ${operator.name} 已被 $refCount 条单据引用，无法物理删除。确认后将停用。"
+                        )
+                        else -> Text("确定永久删除经手人 ${operator.name}？此操作不可恢复。")
+                    }
                 },
                 confirmButton = {
                     TextButton(
                         onClick = {
+                            if (refCount < 0) return@TextButton
                             coroutineScope.launch {
-                                viewModel.deleteOperator(selectedOperator!!)
-                                snackbarHostState.showSnackbar(
-                                    "删除经手人成功"
-                                )
+                                val result = viewModel.deleteOperator(operator)
                                 showDeleteDialog = false
+                                selectedOperator = null
+                                when (result) {
+                                    is ConfigDeleteResult.PcOnly ->
+                                        snackbarHostState.showSnackbar(PC_ONLY_CONFIG_DELETE_MESSAGE)
+                                    is ConfigDeleteResult.PhysicallyDeleted ->
+                                        snackbarHostState.showSnackbar("已永久删除")
+                                    is ConfigDeleteResult.DisabledDueToReferences ->
+                                        snackbarHostState.showSnackbar(
+                                            "已被单据引用，无法物理删除，已停用"
+                                        )
+                                    is ConfigDeleteResult.Failed ->
+                                        snackbarHostState.showSnackbar(result.message)
+                                }
                             }
-                        }
+                        },
+                        enabled = refCount >= 0,
                     ) {
-                        Text("删除")
+                        Text("删除", color = MaterialTheme.colorScheme.error)
                     }
                 },
                 dismissButton = {
-                    TextButton(
-                        onClick = { showDeleteDialog = false }
-                    ) {
+                    TextButton(onClick = {
+                        showDeleteDialog = false
+                        selectedOperator = null
+                    }) {
                         Text("取消")
                     }
-                }
+                },
             )
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun OperatorFormScreen(
+    operatorId: Long?,
+    onSaved: () -> Unit,
+) {
+    val context = LocalContext.current
+    val coroutineScope = rememberCoroutineScope()
+    val viewModel: OperatorConfigViewModel = viewModel(
+        factory = OperatorConfigViewModelFactory(context.applicationContext as Application)
+    )
+    val isEditMode = operatorId != null
+
+    var name by remember { mutableStateOf("") }
+    var phone by remember { mutableStateOf("") }
+    var role by remember { mutableStateOf("操作员") }
+    var remark by remember { mutableStateOf("") }
+    var isNameError by remember { mutableStateOf(false) }
+    var isLoading by remember { mutableStateOf(isEditMode) }
+    var isSaving by remember { mutableStateOf(false) }
+    val roles = listOf("操作员", "管理员", "财务", "仓管员", "销售员")
+
+    LaunchedEffect(operatorId) {
+        if (isEditMode && operatorId != null) {
+            isLoading = true
+            val operator = withContext(Dispatchers.IO) {
+                AppDatabase.getInstance(context).operatorDao().getOperatorById(operatorId)
+            }
+            if (operator != null) {
+                name = operator.name
+                phone = operator.phone
+                role = operator.role
+                remark = operator.remark
+            }
+            isLoading = false
+        }
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .padding(16.dp),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        Text(
+            text = if (isEditMode) "编辑经手人" else "添加经手人",
+            fontSize = 24.sp,
+            fontWeight = FontWeight.Bold,
+            modifier = Modifier.padding(bottom = 24.dp)
+        )
+
+        if (isLoading) {
+            CircularProgressIndicator()
+        } else {
+            OutlinedTextField(
+                value = name,
+                onValueChange = {
+                    name = it
+                    isNameError = false
+                },
+                modifier = Modifier.fillMaxWidth().padding(bottom = 12.dp),
+                label = { Text("姓名 *") },
+                placeholder = { Text("如: 张三") },
+                singleLine = true,
+                isError = isNameError,
+                supportingText = {
+                    if (isNameError) Text("姓名不能为空")
+                },
+            )
+            if (isEditMode) {
+                OutlinedTextField(
+                    value = phone,
+                    onValueChange = { phone = it },
+                    modifier = Modifier.fillMaxWidth().padding(bottom = 12.dp),
+                    label = { Text("联系电话") },
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Phone),
+                )
+                var expanded by remember { mutableStateOf(false) }
+                Box(modifier = Modifier.fillMaxWidth().padding(bottom = 12.dp)) {
+                    OutlinedTextField(
+                        value = role,
+                        onValueChange = { role = it },
+                        modifier = Modifier.fillMaxWidth(),
+                        label = { Text("角色") },
+                        trailingIcon = {
+                            IconButton(onClick = { expanded = true }) {
+                                Icon(Icons.Filled.ArrowDropDown, "选择角色")
+                            }
+                        },
+                        readOnly = true,
+                    )
+                    DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
+                        roles.forEach { roleItem ->
+                            DropdownMenuItem(
+                                text = { Text(roleItem) },
+                                onClick = {
+                                    role = roleItem
+                                    expanded = false
+                                },
+                            )
+                        }
+                    }
+                }
+                OutlinedTextField(
+                    value = remark,
+                    onValueChange = { remark = it },
+                    modifier = Modifier.fillMaxWidth().padding(bottom = 24.dp),
+                    label = { Text("备注") },
+                    maxLines = 3,
+                )
+            }
+        }
+
+        Button(
+            onClick = {
+                if (isSaving) return@Button
+                val nameValid = name.isNotBlank()
+                isNameError = !nameValid
+                if (!nameValid) return@Button
+                isSaving = true
+                coroutineScope.launch {
+                    if (isEditMode) {
+                        val existing = withContext(Dispatchers.IO) {
+                            AppDatabase.getInstance(context).operatorDao().getOperatorById(operatorId!!)
+                        }
+                        if (existing != null) {
+                            viewModel.updateOperator(
+                                existing.copy(
+                                    name = name.trim(),
+                                    phone = phone.trim(),
+                                    role = role.trim(),
+                                    remark = remark.trim(),
+                                ),
+                            )
+                            Toast.makeText(context, "更新经手人成功", Toast.LENGTH_SHORT).show()
+                            onSaved()
+                        } else {
+                            isSaving = false
+                        }
+                    } else {
+                        val success = viewModel.addOperator(
+                            name = name.trim(),
+                            phone = "",
+                            role = "操作员",
+                            remark = "",
+                        )
+                        if (success) {
+                            Toast.makeText(context, "添加经手人成功", Toast.LENGTH_SHORT).show()
+                            onSaved()
+                        } else {
+                            Toast.makeText(context, "经手人姓名已存在", Toast.LENGTH_SHORT).show()
+                            isSaving = false
+                        }
+                    }
+                }
+            },
+            modifier = Modifier.fillMaxWidth(),
+            enabled = !isLoading && !isSaving
+        ) {
+            Text(if (isSaving) "正在保存..." else if (isEditMode) "保存" else "添加")
         }
     }
 }
@@ -292,17 +399,15 @@ fun OperatorItem(
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Column(
-                modifier = Modifier.weight(1f)
-            ) {
+            Column(modifier = Modifier.weight(1f)) {
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
                     Text(
-                        operator.operatorNo,
+                        operator.name,
                         style = MaterialTheme.typography.titleMedium,
-                        color = MaterialTheme.colorScheme.primary
+                        color = MaterialTheme.colorScheme.primary,
                     )
                     Surface(
                         color = MaterialTheme.colorScheme.secondaryContainer,
@@ -329,11 +434,6 @@ fun OperatorItem(
                         }
                     }
                 }
-                Text(
-                    operator.name,
-                    style = MaterialTheme.typography.bodyLarge,
-                    modifier = Modifier.padding(top = 4.dp)
-                )
                 if (operator.phone.isNotEmpty()) {
                     Row(
                         verticalAlignment = Alignment.CenterVertically,
@@ -362,14 +462,8 @@ fun OperatorItem(
                     )
                 }
             }
-
-            Row(
-                horizontalArrangement = Arrangement.spacedBy(4.dp)
-            ) {
-                IconButton(
-                    onClick = onToggleEnabled,
-                    modifier = Modifier.size(36.dp)
-                ) {
+            Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                IconButton(onClick = onToggleEnabled, modifier = Modifier.size(36.dp)) {
                     Icon(
                         if (operator.enabled) Icons.Filled.ToggleOn else Icons.Filled.ToggleOff,
                         contentDescription = if (operator.enabled) "禁用" else "启用",
@@ -377,10 +471,7 @@ fun OperatorItem(
                         else MaterialTheme.colorScheme.outline
                     )
                 }
-                IconButton(
-                    onClick = onDelete,
-                    modifier = Modifier.size(36.dp)
-                ) {
+                IconButton(onClick = onDelete, modifier = Modifier.size(36.dp)) {
                     Icon(
                         Icons.Filled.Delete,
                         contentDescription = "删除",
@@ -390,278 +481,4 @@ fun OperatorItem(
             }
         }
     }
-}
-
-@Composable
-fun AddOperatorDialog(
-    onDismiss: () -> Unit,
-    onConfirm: (String, String, String, String, String) -> Unit
-) {
-    val context = LocalContext.current
-    val coroutineScope = rememberCoroutineScope()
-
-    var operatorNo by remember { mutableStateOf("") }
-    var name by remember { mutableStateOf("") }
-    var isNameError by remember { mutableStateOf(false) }
-    val hasGeneratedNo = remember { mutableStateOf(false) }
-
-    val keyboardController = LocalSoftwareKeyboardController.current
-    val focusRequester = remember { FocusRequester() }
-
-    // 自动生成经手人编号
-    LaunchedEffect(Unit) {
-        if (!hasGeneratedNo.value) {
-            val newNo = withContext(Dispatchers.IO) {
-                try {
-                    val db = com.pingwei.lengkubao.data.db.AppDatabase.getInstance(context)
-                    // 使用 getAllSimple() 方法获取所有经手人列表
-                    val allOperators = db.operatorDao().getAllSimple()
-
-                    var maxNumber = 0
-                    val pattern = Regex("""OP(\d+)""")
-
-                    if (allOperators.isNotEmpty()) {
-                        allOperators.forEach { op ->
-                            val matchResult = pattern.find(op.operatorNo)
-                            if (matchResult != null) {
-                                val number = matchResult.groupValues[1].toIntOrNull() ?: 0
-                                if (number > maxNumber) {
-                                    maxNumber = number
-                                }
-                            }
-                        }
-                    }
-
-                    val newNumber = maxNumber + 1
-                    "OP${String.format("%02d", newNumber)}"
-                } catch (e: Exception) {
-                    e.printStackTrace()
-                    "OP01"
-                }
-            }
-
-            operatorNo = newNo
-            hasGeneratedNo.value = true
-        }
-    }
-
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("添加经手人") },
-        text = {
-            Column(
-                verticalArrangement = Arrangement.spacedBy(12.dp)
-            ) {
-                // 经手人编号 - 自动生成，只读显示
-                OutlinedTextField(
-                    value = operatorNo,
-                    onValueChange = {},
-                    modifier = Modifier.fillMaxWidth(),
-                    label = { Text("经手人编号（自动生成）") },
-                    enabled = false,
-                    colors = TextFieldDefaults.colors(
-                        disabledTextColor = MaterialTheme.colorScheme.primary,
-                        disabledContainerColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.5f),
-                        disabledLabelColor = MaterialTheme.colorScheme.primary
-                    )
-                )
-
-                // 姓名 - 唯一需要填写的
-                OutlinedTextField(
-                    value = name,
-                    onValueChange = {
-                        name = it
-                        isNameError = false
-                    },
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .focusRequester(focusRequester),
-                    label = { Text("姓名 *") },
-                    placeholder = { Text("如: 张三") },
-                    singleLine = true,
-                    isError = isNameError,
-                    supportingText = {
-                        if (isNameError) {
-                            Text("姓名不能为空")
-                        }
-                    }
-                )
-            }
-        },
-        confirmButton = {
-            TextButton(
-                onClick = {
-                    val nameValid = name.isNotBlank()
-                    isNameError = !nameValid
-
-                    if (nameValid) {
-                        keyboardController?.hide()
-                        onConfirm(
-                            operatorNo,  // 使用自动生成的编号
-                            name.trim(),
-                            "",  // 电话传空
-                            "操作员",  // 角色使用默认值
-                            ""   // 备注传空
-                        )
-                        onDismiss()
-                    }
-                }
-            ) {
-                Text("添加")
-            }
-        },
-        dismissButton = {
-            TextButton(onClick = onDismiss) {
-                Text("取消")
-            }
-        }
-    )
-
-    LaunchedEffect(Unit) {
-        focusRequester.requestFocus()
-    }
-}
-
-@Composable
-fun EditOperatorDialog(
-    operator: Operator,
-    onDismiss: () -> Unit,
-    onConfirm: (String, String, String, String, String) -> Unit
-) {
-    var operatorNo by remember { mutableStateOf(operator.operatorNo) }
-    var name by remember { mutableStateOf(operator.name) }
-    var phone by remember { mutableStateOf(operator.phone) }
-    var role by remember { mutableStateOf(operator.role) }
-    var remark by remember { mutableStateOf(operator.remark) }
-
-    var isNoError by remember { mutableStateOf(false) }
-    var isNameError by remember { mutableStateOf(false) }
-
-    val keyboardController = LocalSoftwareKeyboardController.current
-    val roles = listOf("操作员", "管理员", "财务", "仓管员", "销售员")
-
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("编辑经手人") },
-        text = {
-            Column(
-                verticalArrangement = Arrangement.spacedBy(12.dp)
-            ) {
-                OutlinedTextField(
-                    value = operatorNo,
-                    onValueChange = {
-                        operatorNo = it
-                        isNoError = false
-                    },
-                    modifier = Modifier.fillMaxWidth(),
-                    label = { Text("经手人编号 *") },
-                    singleLine = true,
-                    isError = isNoError,
-                    supportingText = {
-                        if (isNoError) {
-                            Text("经手人编号不能为空")
-                        }
-                    }
-                )
-
-                OutlinedTextField(
-                    value = name,
-                    onValueChange = {
-                        name = it
-                        isNameError = false
-                    },
-                    modifier = Modifier.fillMaxWidth(),
-                    label = { Text("姓名 *") },
-                    singleLine = true,
-                    isError = isNameError,
-                    supportingText = {
-                        if (isNameError) {
-                            Text("姓名不能为空")
-                        }
-                    }
-                )
-
-                OutlinedTextField(
-                    value = phone,
-                    onValueChange = { phone = it },
-                    modifier = Modifier.fillMaxWidth(),
-                    label = { Text("联系电话") },
-                    singleLine = true,
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Phone)
-                )
-
-                // 角色选择
-                var expanded by remember { mutableStateOf(false) }
-                Box(
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    OutlinedTextField(
-                        value = role,
-                        onValueChange = { role = it },
-                        modifier = Modifier.fillMaxWidth(),
-                        label = { Text("角色") },
-                        trailingIcon = {
-                            IconButton(onClick = { expanded = true }) {
-                                Icon(Icons.Filled.ArrowDropDown, "选择角色")
-                            }
-                        },
-                        readOnly = true
-                    )
-                    DropdownMenu(
-                        expanded = expanded,
-                        onDismissRequest = { expanded = false }
-                    ) {
-                        roles.forEach { roleItem ->
-                            DropdownMenuItem(
-                                text = { Text(roleItem) },
-                                onClick = {
-                                    role = roleItem
-                                    expanded = false
-                                }
-                            )
-                        }
-                    }
-                }
-
-                OutlinedTextField(
-                    value = remark,
-                    onValueChange = { remark = it },
-                    modifier = Modifier.fillMaxWidth(),
-                    label = { Text("备注") },
-                    singleLine = false,
-                    maxLines = 3
-                )
-            }
-        },
-        confirmButton = {
-            TextButton(
-                onClick = {
-                    val noValid = operatorNo.isNotBlank()
-                    val nameValid = name.isNotBlank()
-
-                    isNoError = !noValid
-                    isNameError = !nameValid
-
-                    if (noValid && nameValid) {
-                        keyboardController?.hide()
-                        onConfirm(
-                            operatorNo.trim(),
-                            name.trim(),
-                            phone.trim(),
-                            role.trim(),
-                            remark.trim()
-                        )
-                        onDismiss()
-                    }
-                }
-            ) {
-                Text("保存")
-            }
-        },
-        dismissButton = {
-            TextButton(onClick = onDismiss) {
-                Text("取消")
-            }
-        }
-    )
 }

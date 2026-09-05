@@ -35,7 +35,7 @@ class SaleOutDetailActivity : ComponentActivity() {
                         modifier = androidx.compose.ui.Modifier.fillMaxSize(),
                         contentAlignment = androidx.compose.ui.Alignment.Center
                     ) {
-                        androidx.compose.material3.Text("销售单编辑功能开发中")
+                        androidx.compose.material3.Text("报账单编辑功能开发中")
                         androidx.compose.material3.Button(
                             onClick = { showEditScreen = false },
                             modifier = androidx.compose.ui.Modifier.align(androidx.compose.ui.Alignment.BottomCenter)

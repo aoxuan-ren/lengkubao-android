@@ -75,7 +75,7 @@
         </activity>
 
         <!-- ========== 配置管理相关 ========== -->
-        <!-- 销售单查询相关Activity -->
+        <!-- 报账单查询相关Activity -->
         <activity
             android:name="com.pingwei.lengkubao.ui.query.saleout.SaleOutQueryActivity"
             android:exported="false" />
@@ -86,6 +86,7 @@
         <activity
             android:name=".ui.config.ConfigMainActivity"
             android:screenOrientation="portrait"
+            android:windowSoftInputMode="adjustResize|stateHidden"
             android:exported="false" />
         <!-- 在 application 标签内，添加 CustomerEditActivity -->
         <activity
@@ -152,6 +153,12 @@
         <activity
             android:name=".ui.advancededuction.AdvanceDeductionActivity"
             android:exported="false" />
+        <!-- 收支流水 -->
+        <activity
+            android:name=".ui.cashflow.CashFlowActivity"
+            android:screenOrientation="portrait"
+            android:exported="false"
+            android:windowSoftInputMode="adjustResize" />
         <!-- 入库开单 -->
         <activity
             android:name=".ui.instock.InStockActivity"
@@ -194,6 +201,12 @@
             android:label="包装单详情"
             android:exported="false"
             android:parentActivityName=".ui.query.packaging.PackagingQueryActivity" />
+
+        <!-- 预支扣款查询 -->
+        <activity
+            android:name=".ui.query.advancededuction.AdvanceDeductionQueryActivity"
+            android:exported="false"
+            android:screenOrientation="portrait" />
 
 
 

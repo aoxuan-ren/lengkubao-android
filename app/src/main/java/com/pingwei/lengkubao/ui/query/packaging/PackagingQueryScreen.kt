@@ -216,7 +216,10 @@ fun PackagingQueryScreen(
             // 查询筛选栏
             QueryFilterBar(
                 searchText = searchText,
-                onSearchTextChange = { searchText = it },
+                onSearchTextChange = {
+                    searchText = it
+                    viewModel.updateKeyword(it)
+                },
                 onSearch = {
                     launchUiTask("条件搜索") {
                         viewModel.search(

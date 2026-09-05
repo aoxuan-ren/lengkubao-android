@@ -9,25 +9,21 @@ data class Location(
     @PrimaryKey(autoGenerate = true)
     val id: Long = 0,
 
-    @ColumnInfo(name = "location_no")
-    val locationNo: String, // 库位编号，如 "A1"
-
     @ColumnInfo(name = "location_name")
-    val locationName: String, // 库位名称，如 "东1库"
+    val locationName: String,
 
     @ColumnInfo(name = "description")
-    val description: String = "", // 描述
+    val description: String = "",
 
     @ColumnInfo(name = "capacity")
-    val capacity: Int = 0, // 容量限制
+    val capacity: Int = 0,
 
     @ColumnInfo(name = "enabled")
-    val enabled: Boolean = true, // 是否启用
+    val enabled: Boolean = true,
 
     @ColumnInfo(name = "create_time")
     val createTime: Long = System.currentTimeMillis(),
 
-    /** 同步状态：0-未同步，1-已同步，默认为0 */
     @ColumnInfo(name = "sync_status", defaultValue = "0")
-    val syncStatus: Int = 0
+    val syncStatus: Int = 0,
 )

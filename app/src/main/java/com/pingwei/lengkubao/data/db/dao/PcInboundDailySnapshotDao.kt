@@ -26,5 +26,8 @@ interface PcInboundDailySnapshotDao {
         endDate: String,
         customerNo: String?
     ): List<PcInboundDailySnapshot>
+
+    @Query("SELECT * FROM pc_inbound_daily_snapshot")
+    suspend fun getAll(): List<PcInboundDailySnapshot>
 }
 

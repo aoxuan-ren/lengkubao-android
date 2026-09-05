@@ -16,6 +16,9 @@ interface ProductDao {
     @Query("SELECT * FROM product WHERE productNo = :productNo LIMIT 1")
     suspend fun getByProductNo(productNo: String): Product?
 
+    @Query("SELECT * FROM product WHERE productName = :productName LIMIT 1")
+    suspend fun getByProductName(productName: String): Product?
+
 
     @Delete
     suspend fun delete(product: Product)
@@ -42,6 +45,13 @@ interface ProductDao {
 
     @Query("UPDATE product SET enabled = :enabled WHERE id = :id")
     suspend fun setEnabled(id: Long, enabled: Boolean)
+
+    @Query("DELETE FROM product WHERE productNo NOT IN (:codes)")
+    suspend fun deleteExceptProductNos(codes: List<String>)
+
+    @Query("DELETE FROM product")
+    suspend fun deleteAllProducts()
+
     @Query("SELECT * FROM product WHERE id = :productId")
     suspend fun getProductById(productId: Long): Product?
     // 添加这个关键方法

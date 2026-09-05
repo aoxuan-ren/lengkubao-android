@@ -1,4 +1,3 @@
-// data/db/entity/PackagingType.kt
 package com.pingwei.lengkubao.data.db.entity
 
 import androidx.room.ColumnInfo
@@ -11,24 +10,21 @@ data class PackagingType(
     @ColumnInfo(name = "id")
     val id: Long = 0,
 
-    @ColumnInfo(name = "type_no")
-    val typeNo: String, // 包装类型编号，如："BZ01"
-
     @ColumnInfo(name = "type_name")
-    val typeName: String, // 包装类型名称，如："纸箱"
+    val typeName: String,
 
     @ColumnInfo(name = "unit")
-    val unit: String = "个", // 单位：个、卷、只等
+    val unit: String = "个",
 
     @ColumnInfo(name = "unit_price")
-    val unitPrice: Double = 0.0, // 默认单价
+    val unitPrice: Double = 0.0,
 
     @ColumnInfo(name = "enabled")
-    val enabled: Boolean = true, // 是否启用
+    val enabled: Boolean = true,
 
     @ColumnInfo(name = "remark")
-    val remark: String = "", // 备注
+    val remark: String = "",
 
     @ColumnInfo(name = "create_time")
-    val createTime: Long = System.currentTimeMillis()
+    val createTime: Long = System.currentTimeMillis(),
 )

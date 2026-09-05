@@ -9,12 +9,19 @@ import com.google.gson.GsonBuilder
 import com.google.gson.JsonSyntaxException
 import androidx.room.withTransaction
 import com.pingwei.lengkubao.data.db.AppDatabase
+import com.pingwei.lengkubao.fiscal.FiscalYearManager
 import com.pingwei.lengkubao.data.db.entity.Customer
+import com.pingwei.lengkubao.data.db.entity.CustomerType
 import com.pingwei.lengkubao.data.db.entity.Location
 import com.pingwei.lengkubao.data.db.entity.Product
 import com.pingwei.lengkubao.data.db.entity.Operator
+import com.pingwei.lengkubao.data.db.entity.PackagingType
 import com.pingwei.lengkubao.data.db.entity.SyncAppliedOp
 import com.pingwei.lengkubao.data.db.entity.SyncDeviceCursor
+import com.pingwei.lengkubao.data.db.entity.SyncLocalOpLog
+import com.pingwei.lengkubao.service.PreSaleSyncApplier
+import com.pingwei.lengkubao.service.StockService
+import com.pingwei.lengkubao.utils.SourceRecordIdUtils
 import com.pingwei.lengkubao.utils.Constant
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
@@ -25,8 +32,14 @@ import java.io.BufferedReader
 import java.io.BufferedWriter
 import java.io.InputStreamReader
 import java.io.OutputStreamWriter
+import java.net.Inet4Address
 import java.net.InetSocketAddress
+import java.net.NetworkInterface
 import java.net.Socket
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import com.pingwei.lengkubao.sync.mdns.MdnsDeviceDiscovery
+import com.pingwei.lengkubao.sync.udp.UdpDeviceDiscovery
 import java.nio.charset.StandardCharsets
 import java.text.SimpleDateFormat
 import java.util.*
@@ -34,6 +47,12 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.min
+
+data class PackagingSyncResult(
+    val success: Boolean,
+    val duplicateNotice: String? = null,
+    val errorMessage: String? = null,
+)
 
 class TcpSyncManager(
     private val context: Context,
@@ -51,6 +70,48 @@ class TcpSyncManager(
     companion object {
         const val TAG = "TcpSyncManager"
 
+        private val IPV4_PATTERN = Regex(
+            "^(?:(?:25[0-5]|2[0-4]\\d|[01]?\\d\\d?)\\.){3}(?:25[0-5]|2[0-4]\\d|[01]?\\d\\d?)$"
+        )
+
+        const val DEFAULT_SERVER_IP = "192.168.1.100"
+
+        fun isValidServerIp(ip: String): Boolean = IPV4_PATTERN.matches(ip.trim())
+
+        fun isUntrustedCachedIp(context: Context, ip: String): Boolean {
+            if (!isValidServerIp(ip)) return true
+            val prefs = context.getSharedPreferences("sync_config", Context.MODE_PRIVATE)
+            val everConnected = prefs.getBoolean(Constant.PREF_SERVER_EVER_CONNECTED, false)
+            if (!everConnected && ip == DEFAULT_SERVER_IP) return true
+            return !isServerOnLocalSubnet(ip)
+        }
+
+        private fun ipPrefix24(ip: String): String? {
+            val parts = ip.trim().split(".")
+            if (parts.size != 4) return null
+            return "${parts[0]}.${parts[1]}.${parts[2]}."
+        }
+
+        private fun getLocalIpv4Addresses(): List<String> {
+            return try {
+                NetworkInterface.getNetworkInterfaces().toList().flatMap { nic ->
+                    if (!nic.isUp || nic.isLoopback) return@flatMap emptyList()
+                    nic.inetAddresses.toList().mapNotNull { addr ->
+                        if (addr is Inet4Address && !addr.isLoopbackAddress) addr.hostAddress else null
+                    }
+                }
+            } catch (_: Exception) {
+                emptyList()
+            }
+        }
+
+        private fun isServerOnLocalSubnet(serverIp: String): Boolean {
+            val serverPrefix = ipPrefix24(serverIp) ?: return true
+            val localIps = getLocalIpv4Addresses()
+            if (localIps.isEmpty()) return true
+            return localIps.any { ipPrefix24(it) == serverPrefix }
+        }
+
         @Volatile
         private var instance: TcpSyncManager? = null
 
@@ -65,9 +126,21 @@ class TcpSyncManager(
 
         fun destroyInstance() {
             instance?.run {
+                try {
+                    val intent = Intent(SyncConnectionObserver.ACTION_TCP_CONNECTION_STATUS).apply {
+                        putExtra(SyncConnectionObserver.EXTRA_IS_CONNECTED, false)
+                        putExtra(SyncConnectionObserver.EXTRA_MESSAGE, "同步管理器已重置")
+                        putExtra("timestamp", System.currentTimeMillis())
+                    }
+                    context.sendBroadcast(intent)
+                } catch (_: Exception) {
+                }
                 disconnect()
+                stopBackgroundDiscovery()
+                discoveryScope.cancel()
                 scope.cancel()
                 _messageChannel.close()
+                lastKnownPcActiveYear = null
                 Log.i(TAG, "🔴 TcpSyncManager 单例已销毁，资源全部释放")
             }
             instance = null
@@ -89,7 +162,15 @@ class TcpSyncManager(
 
     private var syncConfig = SyncConfig()
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private val discoveryScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private val discoveryMutex = Mutex()
     private val syncDao = database.syncDao()
+    private val preSaleSyncApplier by lazy {
+        PreSaleSyncApplier(
+            database,
+            StockService(database.stockDao(), database.stockChangeDao()),
+        )
+    }
 
     private var socket: Socket? = null
     private var writer: BufferedWriter? = null
@@ -125,22 +206,51 @@ class TcpSyncManager(
     private val maxReconnectDelay = 60000L
     private var connectionAttemptCount = 0
     private val maxAttemptCount = 10
+    private var coldStartUntilMs: Long = 0L
+    private val coldStartMaxAttempts = 30
+    private val coldStartRetryIntervalMs = 2000L
+    private var backgroundDiscoveryJob: Job? = null
+    private val backgroundDiscoveryIntervalMs = 5_000L
+    private var lastRediscoverMs = 0L
+    private val minRediscoverIntervalMs = 2_000L
+    private var lastDiscoveryAppliedMs = 0L
+    private val discoveryApplyGraceMs = 30_000L
+    private var consecutiveConnectFailures = 0
+    private val discoverFirstRetryIntervalMs = 3_000L
 
     private var heartbeatJob: Job? = null
+    private var connectionMonitorJob: Job? = null
+    private var postConnectSyncJob: Job? = null
+    private var registrationTimeoutJob: Job? = null
+    private val postConnectSyncRunning = AtomicBoolean(false)
     private val confirmedItems = Collections.synchronizedSet(mutableSetOf<String>())
     private val pendingAckMap = ConcurrentHashMap<String, CompletableDeferred<Boolean>>()
+    private val pendingUnifiedAckMap = ConcurrentHashMap<String, CompletableDeferred<Boolean>>()
+    private val packagingIdempotentNotices = ConcurrentHashMap<String, String>()
+    private val packagingAckFailureMessages = ConcurrentHashMap<String, String>()
     private val pendingCommandMap = ConcurrentHashMap<String, CompletableDeferred<String>>()
+    @Volatile
+    private var lastKnownPcActiveYear: Int? = null
+    @Volatile
+    private var lastKnownServerCommitSeq: Long? = null
+    @Volatile
+    private var lastFullSyncBaselineSeq: Long? = null
 
     init {
         loadConfig()
+        CrsqlHelper.tryLoad(context)
         Log.i(TAG, "🔄 TcpSyncManager 初始化完成，已加载本地配置：${syncConfig.serverIp}:${syncConfig.serverPort}")
     }
 
     private fun loadConfig() {
         val prefs = context.getSharedPreferences("sync_config", Context.MODE_PRIVATE)
+        val pairedIp = prefs.getString(Constant.PREF_PAIRED_SERVER_IP, null)?.trim()
+        val pairedPort = prefs.getInt(Constant.PREF_PAIRED_SERVER_PORT, 0)
+        val defaultIp = prefs.getString("server_ip", DEFAULT_SERVER_IP) ?: DEFAULT_SERVER_IP
+        val defaultPort = prefs.getInt("server_port", 8080)
         syncConfig = SyncConfig(
-            serverIp = prefs.getString("server_ip", "192.168.1.100") ?: "192.168.1.100",
-            serverPort = prefs.getInt("server_port", 8080),
+            serverIp = if (!pairedIp.isNullOrBlank() && isValidServerIp(pairedIp)) pairedIp else defaultIp,
+            serverPort = if (pairedPort > 0) pairedPort else defaultPort,
             reconnectInterval = prefs.getLong("reconnect_interval", 5000),
             heartbeatInterval = prefs.getLong("heartbeat_interval", 30000),
             sendTimeout = prefs.getInt("send_timeout", 10000),
@@ -152,6 +262,23 @@ class TcpSyncManager(
     fun clearConfirmedItems() {
         confirmedItems.clear()
         Log.i(TAG, "🧹 已清理 confirmedItems，允许重发已确认单据")
+    }
+
+    private fun removeConfirmedItem(uniqueKey: String) {
+        if (confirmedItems.remove(uniqueKey)) {
+            Log.d(TAG, "🧹 已移除 confirmedItems：$uniqueKey")
+        }
+    }
+
+    fun clearConfirmedItemsForPackagingBill(billId: Long) {
+        val marker = "_PACKAGING_${billId}_"
+        val toRemove = confirmedItems.filter { key ->
+            key.startsWith("PACKAGING|") && key.contains(marker)
+        }
+        toRemove.forEach { confirmedItems.remove(it) }
+        if (toRemove.isNotEmpty()) {
+            Log.i(TAG, "🧹 已清除包装单 id=$billId 的 confirmedItems 缓存（${toRemove.size}项）")
+        }
     }
 
     fun updateConfig(config: SyncConfig) {
@@ -174,6 +301,18 @@ class TcpSyncManager(
         }
     }
 
+    fun enableColdStartMode(durationMs: Long = 90_000L) {
+        coldStartUntilMs = System.currentTimeMillis() + durationMs
+        Log.i(TAG, "❄️ 冷启动快速重连已启用，持续 ${durationMs / 1000}s")
+    }
+
+    /** 外部发现（如 Service 启动扫描）成功后调用，避免紧接着 connect 再次全量扫网 */
+    fun notifyDiscoveryApplied() {
+        lastDiscoveryAppliedMs = System.currentTimeMillis()
+    }
+
+    private fun isColdStartMode(): Boolean = System.currentTimeMillis() < coldStartUntilMs
+
     fun connect() {
         scope.launch {
             if (isConnecting.get() || isConnected.get()) {
@@ -187,6 +326,7 @@ class TcpSyncManager(
             connectionAttemptCount = 0
             reconnectDelay = syncConfig.reconnectInterval
 
+            startBackgroundDiscovery()
             connectInternal()
         }
     }
@@ -203,6 +343,36 @@ class TcpSyncManager(
             if (isConnected.get() || isConnecting.get()) {
                 Log.w(TAG, "⚠️ 已经连接或正在连接中，跳过重复连接")
                 return@launch
+            }
+
+            if (!isValidServerIp(syncConfig.serverIp)) {
+                Log.w(TAG, "⚠️ 服务器IP无效: ${syncConfig.serverIp}，尝试重新发现")
+                isConnecting.set(false)
+                _connectionState.value = ConnectionState.ERROR
+                if (shouldReconnect.get()) {
+                    val updated = awaitServerDiscovery(force = true)
+                    if (updated) {
+                        connectInternal()
+                    } else {
+                        scheduleSmartReconnect()
+                    }
+                }
+                return@launch
+            }
+
+            if (shouldDiscoverBeforeConnect()) {
+                Log.d(TAG, "🔍 连接前优先扫网（失败${consecutiveConnectFailures}次 / 不可信IP=${isUntrustedServerIp()})")
+                _connectionState.value = ConnectionState.CONNECTING
+                val updated = awaitServerDiscovery(force = true)
+                if (updated) {
+                    Log.i(TAG, "✅ 扫网发现新地址: ${syncConfig.serverIp}:${syncConfig.serverPort}")
+                } else if (isUntrustedServerIp()) {
+                    Log.w(TAG, "⚠️ 无可信缓存IP且扫网未发现，跳过TCP等待")
+                    isConnecting.set(false)
+                    _connectionState.value = ConnectionState.WAITING_RECONNECT
+                    scheduleSmartReconnect()
+                    return@launch
+                }
             }
 
             isConnecting.set(true)
@@ -232,24 +402,15 @@ class TcpSyncManager(
 
                 isConnected.set(true)
                 isConnecting.set(false)
-                _connectionState.value = ConnectionState.CONNECTED
-                connectionAttemptCount = 0
-                reconnectDelay = syncConfig.reconnectInterval
-                Log.i(TAG, "✅ TCP连接成功！服务器地址: ${socket!!.inetAddress.hostAddress}")
+                clearConfirmedItems()
+                Log.i(TAG, "✅ TCP连接成功！等待服务器注册确认: ${socket!!.inetAddress.hostAddress}")
 
                 startConnectionMonitor()
 
                 delay(500)
                 sendRegistration()
-                startHeartbeat()
+                startRegistrationTimeout()
                 startMessageListener()
-                delay(1000)
-
-                sendConnectionBroadcast(true, "已连接到服务器")
-
-                if (isConnected.get() && isRegistered.get()) {
-                    autoSyncPendingData()
-                }
 
             } catch (e: Exception) {
                 Log.e(TAG, "❌ TCP连接失败: ${e.message}", e)
@@ -257,6 +418,7 @@ class TcpSyncManager(
                 isConnecting.set(false)
                 isConnected.set(false)
                 isRegistered.set(false)
+                consecutiveConnectFailures++
 
                 sendConnectionBroadcast(false, e.message ?: "连接失败")
 
@@ -265,6 +427,142 @@ class TcpSyncManager(
                 }
             }
         }
+    }
+
+    private fun isUntrustedServerIp(): Boolean =
+        isUntrustedCachedIp(context, syncConfig.serverIp)
+
+    private fun shouldDiscoverBeforeConnect(): Boolean {
+        if (System.currentTimeMillis() - lastDiscoveryAppliedMs < discoveryApplyGraceMs) {
+            return false
+        }
+        return consecutiveConnectFailures >= 1 || isUntrustedServerIp()
+    }
+
+    private suspend fun awaitServerDiscovery(force: Boolean): Boolean {
+        return discoveryScope.async {
+            runServerDiscovery(force)
+        }.await()
+    }
+
+    private suspend fun runServerDiscovery(force: Boolean): Boolean {
+        return discoveryMutex.withLock {
+            val now = System.currentTimeMillis()
+            if (!force && now - lastRediscoverMs < minRediscoverIntervalMs) {
+                return@withLock false
+            }
+            lastRediscoverMs = now
+
+            try {
+                withContext(NonCancellable) {
+                    performServerDiscoveryScan()
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "⚠️ 重新发现服务器失败: ${e.message}")
+                false
+            }
+        }
+    }
+
+    private suspend fun performServerDiscoveryScan(): Boolean {
+        val pairingCode = getPairingCode()
+        if (pairingCode.isBlank()) {
+            return false
+        }
+
+        val prefs = context.getSharedPreferences("sync_config", Context.MODE_PRIVATE)
+        val discoveryMethod = prefs.getString(Constant.PREF_DISCOVERY_METHOD, "both") ?: "both"
+
+        var discoveredIp: String? = null
+        var discoveredPort: Int? = null
+
+        if (discoveryMethod == "mdns" || discoveryMethod == "both") {
+            val mdnsDevice = MdnsDeviceDiscovery.getInstance(context).autoConnect(pairingCode)
+            if (mdnsDevice != null) {
+                discoveredIp = mdnsDevice.ip
+                discoveredPort = mdnsDevice.port
+            }
+        }
+
+        if (discoveredIp == null && (discoveryMethod == "udp" || discoveryMethod == "both")) {
+            val udp = UdpDeviceDiscovery.getInstance(context)
+            val device = udp.autoConnect(
+                pairingCode,
+                announceTimeoutMs = 2000L,
+                discoverTimeoutMs = 5000L,
+            )
+            if (device != null) {
+                discoveredIp = device.ip
+                discoveredPort = device.port
+            }
+        }
+
+        return if (discoveredIp != null && discoveredPort != null) {
+            applyDiscoveredServer(discoveredIp, discoveredPort)
+        } else {
+            false
+        }
+    }
+
+    private fun applyDiscoveredServer(ip: String, port: Int): Boolean {
+        val current = syncConfig
+        if (ip == current.serverIp && port == current.serverPort) {
+            return false
+        }
+        Log.i(TAG, "🔄 重新发现服务器: $ip:$port (原 ${current.serverIp}:${current.serverPort})")
+        updateConfig(current.copy(serverIp = ip, serverPort = port))
+        context.getSharedPreferences("sync_config", Context.MODE_PRIVATE).edit()
+            .putString(Constant.PREF_PAIRED_SERVER_IP, ip)
+            .putInt(Constant.PREF_PAIRED_SERVER_PORT, port)
+            .apply()
+        consecutiveConnectFailures = 0
+        connectionAttemptCount = 0
+        reconnectDelay = syncConfig.reconnectInterval
+        lastDiscoveryAppliedMs = System.currentTimeMillis()
+        return true
+    }
+
+    private fun markServerEverConnected() {
+        context.getSharedPreferences("sync_config", Context.MODE_PRIVATE).edit()
+            .putBoolean(Constant.PREF_SERVER_EVER_CONNECTED, true)
+            .apply()
+    }
+
+    private fun startRegistrationTimeout() {
+        registrationTimeoutJob?.cancel()
+        registrationTimeoutJob = scope.launch {
+            delay(10_000)
+            if (isConnected.get() && !isRegistered.get()) {
+                Log.w(TAG, "⏰ 注册超时，未收到 REGISTER_OK，断开并重连")
+                handleConnectionLost()
+            }
+        }
+    }
+
+    private fun startBackgroundDiscovery() {
+        backgroundDiscoveryJob?.cancel()
+        backgroundDiscoveryJob = discoveryScope.launch {
+            while (isActive && shouldReconnect.get()) {
+                if (isConnected.get() && isRegistered.get()) break
+
+                val updated = runServerDiscovery(force = true)
+                if (updated && shouldReconnect.get() && !isConnected.get() && !isConnecting.get()) {
+                    connectionAttemptCount = 0
+                    consecutiveConnectFailures = 0
+                    reconnectDelay = syncConfig.reconnectInterval
+                    reconnectJob.get()?.cancel()
+                    Log.i(TAG, "🔍 后台发现新服务器，立即尝试连接")
+                    connectInternal()
+                }
+
+                delay(backgroundDiscoveryIntervalMs)
+            }
+        }
+    }
+
+    private fun stopBackgroundDiscovery() {
+        backgroundDiscoveryJob?.cancel()
+        backgroundDiscoveryJob = null
     }
 
     private suspend fun sendRegistration() {
@@ -369,15 +667,19 @@ class TcpSyncManager(
         scope.launch {
             connectionAttemptCount++
 
-            if (connectionAttemptCount > 1) {
+            val inColdStart = isColdStartMode()
+            val untrustedIp = isUntrustedServerIp()
+            val effectiveMaxAttempts = if (inColdStart) coldStartMaxAttempts else maxAttemptCount
+
+            if (!inColdStart && !untrustedIp && connectionAttemptCount > 1) {
                 reconnectDelay = min(
                     reconnectDelay * 2,
                     maxReconnectDelay
                 )
             }
 
-            if (connectionAttemptCount > maxAttemptCount) {
-                Log.w(TAG, "⚠️  已达到最大重连尝试次数(${maxAttemptCount}次)，暂停重连")
+            if (connectionAttemptCount > effectiveMaxAttempts && !inColdStart) {
+                Log.w(TAG, "⚠️  已达到最大重连尝试次数(${effectiveMaxAttempts}次)，暂停重连")
                 _connectionState.value = ConnectionState.WAITING_RECONNECT
 
                 delay(30 * 60 * 1000)
@@ -387,15 +689,20 @@ class TcpSyncManager(
                 return@launch
             }
 
-            val delayTime = if (connectionAttemptCount == 1) {
-                syncConfig.reconnectInterval
-            } else {
-                reconnectDelay
+            val delayTime = when {
+                inColdStart -> coldStartRetryIntervalMs
+                untrustedIp || consecutiveConnectFailures >= 1 -> discoverFirstRetryIntervalMs
+                connectionAttemptCount == 1 -> syncConfig.reconnectInterval
+                else -> reconnectDelay
             }
 
-            Log.i(TAG, "⏳ 第${connectionAttemptCount}次尝试重连，${delayTime}ms后重连...")
+            Log.i(
+                TAG,
+                "⏳ 第${connectionAttemptCount}次尝试重连，${delayTime}ms后重连..." +
+                    if (untrustedIp) " (扫网优先)" else ""
+            )
             _connectionState.value = ConnectionState.WAITING_RECONNECT
-            updateNotification("等待重连 (${delayTime/1000}秒后)")
+            updateNotification("等待重连 (${delayTime / 1000}秒后)")
 
             delay(delayTime)
 
@@ -407,7 +714,8 @@ class TcpSyncManager(
     }
 
     private fun startConnectionMonitor() {
-        scope.launch {
+        connectionMonitorJob?.cancel()
+        connectionMonitorJob = scope.launch {
             while (shouldReconnect.get()) {
                 delay(60000)
 
@@ -423,6 +731,38 @@ class TcpSyncManager(
                 if (isConnected.get()) {
                     testConnectionAlive()
                 }
+            }
+        }
+    }
+
+    private fun stopConnectionMonitor() {
+        connectionMonitorJob?.cancel()
+        connectionMonitorJob = null
+    }
+
+    private fun schedulePostConnectSync() {
+        postConnectSyncJob?.cancel()
+        postConnectSyncJob = scope.launch {
+            delay(1000)
+            if (!isConnected.get() || !isRegistered.get()) {
+                Log.d(TAG, "连接后同步跳过：连接或注册状态已变化")
+                return@launch
+            }
+            if (!postConnectSyncRunning.compareAndSet(false, true)) {
+                Log.w(TAG, "连接后同步已在进行中，跳过重复触发")
+                return@launch
+            }
+            try {
+                if (!ensureSyncYearAligned()) {
+                    return@launch
+                }
+                if (!isConnected.get() || !isRegistered.get()) {
+                    return@launch
+                }
+                autoSyncPendingData()
+                autoBidirectionalDeltaSyncOnConnect(skipHelloSync = true)
+            } finally {
+                postConnectSyncRunning.set(false)
             }
         }
     }
@@ -459,6 +799,10 @@ class TcpSyncManager(
             _connectionState.value = ConnectionState.DISCONNECTED
 
             stopHeartbeat()
+            stopConnectionMonitor()
+            postConnectSyncJob?.cancel()
+            registrationTimeoutJob?.cancel()
+            postConnectSyncRunning.set(false)
 
             try {
                 writer?.close()
@@ -473,16 +817,17 @@ class TcpSyncManager(
             socket = null
 
             if (shouldReconnect.get()) {
+                startBackgroundDiscovery()
                 scheduleSmartReconnect()
             }
         }
     }
 
     private fun sendConnectionBroadcast(isConnected: Boolean, message: String) {
-        val intent = Intent("TCP_CONNECTION_STATUS")
+        val intent = Intent(SyncConnectionObserver.ACTION_TCP_CONNECTION_STATUS)
             .apply {
-                putExtra("is_connected", isConnected)
-                putExtra("message", message)
+                putExtra(SyncConnectionObserver.EXTRA_IS_CONNECTED, isConnected)
+                putExtra(SyncConnectionObserver.EXTRA_MESSAGE, message)
                 putExtra("timestamp", System.currentTimeMillis())
             }
         context.sendBroadcast(intent)
@@ -496,12 +841,27 @@ class TcpSyncManager(
             val pendingIn = database.inStockBillDao().getAllBills().first().filter { it.syncStatus == 0 }
             val pendingSale = database.saleBillDao().getAllBills().first().filter { it.syncStatus == 0 }
             val pendingPack = database.packagingBillDao().getAllBills().first().filter { !it.isSynced }
+            val pendingAdvances = database.advanceDao().getUnsyncedAdvances()
+            val pendingDeductions = database.deductionDao().getUnsyncedDeductions()
+            val pendingPresales = database.preSaleBillDao().getUnsyncedBills()
+            val pendingPresalePayments = database.paymentRecordDao().getUnsyncedPayments()
+            val pendingLedger = database.ledgerEntryDao().getUnsyncedEntries()
 
-            val totalPending = pendingIn.size + pendingSale.size + pendingPack.size
+            val totalPending = pendingIn.size + pendingSale.size + pendingPack.size +
+                pendingAdvances.size + pendingDeductions.size +
+                pendingPresales.size + pendingPresalePayments.size + pendingLedger.size
 
             if (totalPending > 0) {
-                Log.i(TAG, "🔍 发现 $totalPending 张未同步单据，开始自动同步...")
-                _messageChannel.send("发现 $totalPending 张未同步单据，开始自动同步...")
+                val detail = buildString {
+                    append("入库${pendingIn.size}，销售${pendingSale.size}，包装${pendingPack.size}")
+                    if (pendingAdvances.isNotEmpty()) append("，预支${pendingAdvances.size}")
+                    if (pendingDeductions.isNotEmpty()) append("，扣款${pendingDeductions.size}")
+                    if (pendingPresales.isNotEmpty()) append("，预售${pendingPresales.size}")
+                    if (pendingPresalePayments.isNotEmpty()) append("，预售收款${pendingPresalePayments.size}")
+                    if (pendingLedger.isNotEmpty()) append("，流水${pendingLedger.size}")
+                }
+                Log.i(TAG, "🔍 发现 $totalPending 条未同步数据（$detail），开始自动同步...")
+                _messageChannel.send("发现 $totalPending 条未同步数据，开始自动同步...")
                 val syncResult = syncPendingData()
 
                 if (syncResult) {
@@ -510,8 +870,8 @@ class TcpSyncManager(
                     Log.e(TAG, "❌ 自动同步失败")
                 }
             } else {
-                Log.i(TAG, "✅ 所有单据已同步，无需同步")
-                _messageChannel.send("✅ 所有单据已同步")
+                Log.i(TAG, "✅ 所有数据已同步，无需同步")
+                _messageChannel.send("✅ 所有数据已同步")
             }
         } catch (e: Exception) {
             Log.e(TAG, "❌ 自动同步检查失败: ${e.message}", e)
@@ -525,6 +885,7 @@ class TcpSyncManager(
 
     fun disconnect() {
         shouldReconnect.set(false)
+        stopBackgroundDiscovery()
         reconnectJob.get()?.cancel()
         reconnectJob.set(null)
         disconnectInternal()
@@ -544,6 +905,10 @@ class TcpSyncManager(
                 _syncState.value = SyncState.Idle
 
                 stopHeartbeat()
+                stopConnectionMonitor()
+                postConnectSyncJob?.cancel()
+                registrationTimeoutJob?.cancel()
+                postConnectSyncRunning.set(false)
 
                 writer?.close()
                 reader?.close()
@@ -633,6 +998,10 @@ class TcpSyncManager(
         timeoutMs: Long = 30000L,
     ): String? {
         return withContext(Dispatchers.IO) {
+            if (!isRegistered.get()) {
+                Log.w(TAG, "未注册，跳过等待命令 $expectedCommand")
+                return@withContext null
+            }
             val deferred = CompletableDeferred<String>()
             pendingCommandMap[expectedCommand] = deferred
             try {
@@ -659,11 +1028,6 @@ class TcpSyncManager(
             try {
                 val uniqueKey = "$dataType|$billNo|$itemKey"
 
-                if (confirmedItems.contains(uniqueKey)) {
-                    Log.d(TAG, "⏭️ 跳过已确认的项：$uniqueKey")
-                    return@withContext true
-                }
-
                 val existingAck = pendingAckMap[ackKey]
                 if (existingAck != null) {
                     Log.w(TAG, "🔁 检测到重复ACK等待，复用已有等待：$ackKey")
@@ -674,27 +1038,27 @@ class TcpSyncManager(
                     return@withContext reusedResult
                 }
 
-                val message = "$dataType|$jsonData"
-                val ackDeferred = CompletableDeferred<Boolean>()
-                pendingAckMap[ackKey] = ackDeferred
+                val pushMessage = UnifiedPushHelper.buildPushMessage(billNo, dataType, jsonData)
+                val unifiedDeferred = CompletableDeferred<Boolean>()
+                pendingUnifiedAckMap[billNo] = unifiedDeferred
                 ownsAckRegistration = true
 
-                val sendSuccess = sendMessage(message)
+                val sendSuccess = sendMessage(pushMessage)
                 if (!sendSuccess) {
-                    pendingAckMap.remove(ackKey)
-                    ackDeferred.complete(false)
+                    pendingUnifiedAckMap.remove(billNo)
                     Log.e(TAG, "❌ 发送失败：$dataType $billNo")
                     return@withContext false
                 }
 
-                Log.d(TAG, "📤 已发送 $dataType $billNo，等待服务器确认...")
-                val result = withTimeoutOrNull(30000L) { ackDeferred.await() } ?: false
+                Log.d(TAG, "📤 已发送 PUSH $dataType $billNo，等待 ACK...")
+                val result = withTimeoutOrNull(30000L) { unifiedDeferred.await() } ?: false
 
                 if (result) {
                     confirmedItems.add(uniqueKey)
-                    Log.i(TAG, "✅ 服务器确认成功：$dataType $billNo")
+                    Log.i(TAG, "✅ 服务器 ACK 确认：$dataType $billNo")
                 } else {
-                    Log.e(TAG, "⏰ 等待服务器确认超时/失败：$dataType $billNo")
+                    removeConfirmedItem(uniqueKey)
+                    Log.e(TAG, "⏰ 等待 ACK 超时/失败：$dataType $billNo")
                 }
                 return@withContext result
             } catch (e: CancellationException) {
@@ -705,7 +1069,7 @@ class TcpSyncManager(
                 return@withContext false
             } finally {
                 if (ownsAckRegistration) {
-                    pendingAckMap.remove(ackKey)
+                    pendingUnifiedAckMap.remove(billNo)
                 }
             }
         }
@@ -734,7 +1098,43 @@ class TcpSyncManager(
 
                 val pendingPack = database.packagingBillDao().getAllBills().first().filter { !it.isSynced }
                 pendingPack.forEach { bill ->
-                    val success = syncPackagingBill(bill.id)
+                    val success = syncPackagingBill(bill.id).success
+                    if (success) successCount++ else failCount++
+                    delay(500)
+                }
+
+                database.advanceDao().getUnsyncedAdvances().forEach { advance ->
+                    val success = syncAdvance(advance.id)
+                    if (success) successCount++ else failCount++
+                    delay(500)
+                }
+
+                database.deductionDao().getUnsyncedDeductions().forEach { deduction ->
+                    val success = syncDeduction(deduction.id)
+                    if (success) successCount++ else failCount++
+                    delay(500)
+                }
+
+                database.outboundRecordDao().getUnsyncedRecords().forEach { record ->
+                    val success = syncPreSaleOutbound(record.id)
+                    if (success) successCount++ else failCount++
+                    delay(500)
+                }
+
+                database.preSaleBillDao().getUnsyncedBills().forEach { bill ->
+                    val success = syncPreSaleBill(bill.id)
+                    if (success) successCount++ else failCount++
+                    delay(500)
+                }
+
+                database.paymentRecordDao().getUnsyncedPayments().forEach { payment ->
+                    val success = syncPreSalePayment(payment.id)
+                    if (success) successCount++ else failCount++
+                    delay(500)
+                }
+
+                database.ledgerEntryDao().getUnsyncedEntries().forEach { entry ->
+                    val success = syncLedgerEntry(entry.id)
                     if (success) successCount++ else failCount++
                     delay(500)
                 }
@@ -768,8 +1168,21 @@ class TcpSyncManager(
             val separatorIndex = sanitized.indexOf('|')
             val command = if (separatorIndex >= 0) sanitized.substring(0, separatorIndex) else sanitized
             val data = if (separatorIndex >= 0) sanitized.substring(separatorIndex + 1) else ""
-            if (command == "PUSH_CHANGES_ACK" || command == "PULL_DELTA_RESP") {
+            if (command == "PUSH_CHANGES_ACK" || command == "PULL_DELTA_RESP" || command == "CONFIG_PULL_RESP" || command == "CONFIG_PUSH_ACK") {
                 completeCommand(command, data)
+                return
+            }
+            if (command == "ACK") {
+                UnifiedPushHelper.parseAck(message)?.let { (opId, ok) ->
+                    pendingUnifiedAckMap.remove(opId)?.complete(ok)
+                    Log.d(TAG, if (ok) "✅ 收到 ACK ok: $opId" else "❌ 收到 ACK fail: $opId")
+                }
+                return
+            }
+            if (command == "SYNC_SERVER_READY") {
+                Log.i(TAG, "✅ 服务器已就绪：$data")
+                completeCommand("SYNC_SERVER_READY", data)
+                _messageChannel.send("服务器已就绪：$data")
                 return
             }
 
@@ -790,15 +1203,51 @@ class TcpSyncManager(
             when (command) {
                 "REGISTER_OK" -> {
                     Log.i(TAG, "✅ 服务器注册确认成功：$data")
+                    registrationTimeoutJob?.cancel()
+                    connectionAttemptCount = 0
+                    consecutiveConnectFailures = 0
+                    reconnectDelay = syncConfig.reconnectInterval
+                    markServerEverConnected()
+                    stopBackgroundDiscovery()
                     isRegistered.set(true)
+                    _connectionState.value = ConnectionState.CONNECTED
+                    startHeartbeat()
+                    sendConnectionBroadcast(true, "已连接到服务器")
                     _messageChannel.send("✅ 服务器连接成功：$data")
-
-                    scope.launch {
-                        delay(1000)
-                        if (isConnected.get() && isRegistered.get()) {
-                            autoSyncPendingData()
-                        }
+                    schedulePostConnectSync()
+                }
+                "REGISTER_FAIL" -> {
+                    val sessionExpired = data.contains("会话无效") || data.contains("请先发送 REGISTER")
+                    Log.e(TAG, "❌ 服务器拒绝注册：$data")
+                    registrationTimeoutJob?.cancel()
+                    if (sessionExpired) {
+                        Log.w(TAG, "🔄 会话失效，断开并重连...")
+                        isRegistered.set(false)
+                        sendConnectionBroadcast(false, "会话失效，正在重连...")
+                        handleConnectionLost()
+                        return
                     }
+
+                    shouldReconnect.set(false)
+                    isRegistered.set(false)
+                    isConnected.set(false)
+                    isConnecting.set(false)
+                    stopHeartbeat()
+                    stopConnectionMonitor()
+                    postConnectSyncJob?.cancel()
+                    postConnectSyncRunning.set(false)
+                    try {
+                        writer?.close()
+                        reader?.close()
+                        socket?.close()
+                    } catch (_: Exception) {
+                    }
+                    writer = null
+                    reader = null
+                    socket = null
+                    _connectionState.value = ConnectionState.ERROR
+                    sendConnectionBroadcast(false, "配对码错误：$data")
+                    _messageChannel.send("❌ 配对码错误：$data")
                 }
                 "PUSH_DATA" -> {
                     Log.d(TAG, "📥 收到服务器推送数据：${data.take(120)}")
@@ -809,27 +1258,57 @@ class TcpSyncManager(
                 }
                 "HANDSHAKE_OK" -> {
                     Log.i(TAG, "✅ 握手成功：$data")
+                    registrationTimeoutJob?.cancel()
                     isRegistered.set(true)
+                    _connectionState.value = ConnectionState.CONNECTED
+                    startHeartbeat()
                     _messageChannel.send("握手成功：$data")
                 }
                 "PONG" -> {
                     Log.v(TAG, "💓 收到心跳响应：$data")
                 }
-                "SYNC_SERVER_READY" -> {
-                    Log.i(TAG, "✅ 服务器已就绪：$data")
-                    _messageChannel.send("服务器已就绪：$data")
+                "DELTA_AVAILABLE" -> {
+                    Log.i(TAG, "📣 收到增量可用通知：$data")
+                    scope.launch {
+                        try {
+                            val deviceId = getDeviceId()
+                            val skipReason = getDownstreamDeltaSkipReason(deviceId)
+                            if (skipReason != null) {
+                                Log.i(TAG, "⏭️ 忽略 DELTA_AVAILABLE：$skipReason")
+                                return@launch
+                            }
+                            var fromSeq = syncDao.getCursor(deviceId)?.lastAckedSeq ?: 0L
+                            var latestAckedSeq = pullAndApplyDelta(deviceId, fromSeq)
+                            if (latestAckedSeq == null) {
+                                latestAckedSeq = recoverDownstreamConfigFromPc(deviceId)
+                                fromSeq = syncDao.getCursor(deviceId)?.lastAckedSeq ?: fromSeq
+                            }
+                            if (latestAckedSeq != null) {
+                                syncDao.updateLastAckedSeq(deviceId, latestAckedSeq, System.currentTimeMillis())
+                                com.pingwei.lengkubao.utils.ConfigSyncStatusNotifier.notifyChanged()
+                            }
+                        } catch (e: Exception) {
+                            Log.e(TAG, "❌ DELTA_AVAILABLE 拉取失败: ${e.message}", e)
+                        }
+                    }
                 }
                 "SYNC_SUCCESS" -> {
-                    val subParts = data.split("|", limit = 4)
+                    val subParts = data.split("|", limit = 6)
                     if (subParts.size >= 2) {
                         val dataType = subParts[0]
                         val code = subParts[1]
                         val extraInfo = if (subParts.size >= 4) subParts[3] else ""
                         val isSourceRecordAck = code.startsWith("SRC_")
+                        if (dataType == "PACKAGING" && subParts.size >= 5 && subParts[3] == "IDEMPOTENT") {
+                            val idempotentReason = subParts.getOrElse(4) { "" }
+                            if (idempotentReason.isNotBlank()) {
+                                packagingIdempotentNotices["$dataType|$code"] = idempotentReason
+                            }
+                        }
                         completeAck(dataType, code, true)
 
                         when (dataType) {
-                            "INBOUND", "SALES", "PACKAGING" -> {
+                            "INBOUND", "SALES" -> {
                                 Log.i(TAG, "✅ 同步确认成功：$dataType $code")
                                 if (isSourceRecordAck) {
                                     scope.launch { updateSyncStatusBySourceRecordId(dataType, code, true) }
@@ -838,6 +1317,9 @@ class TcpSyncManager(
                                         updateSyncStatus(code, dataType, true)
                                     }
                                 }
+                            }
+                            "PACKAGING" -> {
+                                Log.i(TAG, "✅ 包装明细同步确认成功：$code（整单状态由 syncPackagingBill 统一更新）")
                             }
                             "ADVANCE", "DEDUCTION" -> {
                                 Log.i(TAG, "✅ 预支扣款同步确认成功：$dataType $code")
@@ -848,6 +1330,12 @@ class TcpSyncManager(
                                         val dateInfo = if (extraInfo.isNotEmpty()) extraInfo else null
                                         updateAdvanceDeductionStatus(dataType, code, true, dateInfo)
                                     }
+                                }
+                            }
+                            "PRESALE", "PRESALE_PAYMENT", "PRESALE_OUTBOUND", "LEDGER" -> {
+                                Log.i(TAG, "✅ 预售/流水同步确认成功：$dataType $code")
+                                if (isSourceRecordAck) {
+                                    scope.launch { updateSyncStatusBySourceRecordId(dataType, code, true) }
                                 }
                             }
                             "LOCATION", "OPERATOR", "CUSTOMER" -> {
@@ -871,14 +1359,23 @@ class TcpSyncManager(
                         completeAck(dataType, billNo, false)
                         Log.e(TAG, "❌ 同步确认失败：$dataType $billNo - $errorMsg")
                         when (dataType) {
-                            "INBOUND", "SALES", "PACKAGING" -> {
+                            "INBOUND", "SALES" -> {
                                 if (isSourceRecordAck) {
                                     scope.launch { updateSyncStatusBySourceRecordId(dataType, billNo, false) }
                                 } else {
                                     scope.launch { updateSyncStatus(billNo, dataType, false) }
                                 }
                             }
+                            "PACKAGING" -> {
+                                packagingAckFailureMessages["$dataType|$billNo"] = errorMsg
+                                Log.w(TAG, "❌ 包装明细同步失败：$billNo - $errorMsg")
+                            }
                             "ADVANCE", "DEDUCTION" -> {
+                                if (isSourceRecordAck) {
+                                    scope.launch { updateSyncStatusBySourceRecordId(dataType, billNo, false) }
+                                }
+                            }
+                            "PRESALE", "PRESALE_PAYMENT", "PRESALE_OUTBOUND", "LEDGER" -> {
                                 if (isSourceRecordAck) {
                                     scope.launch { updateSyncStatusBySourceRecordId(dataType, billNo, false) }
                                 }
@@ -914,13 +1411,7 @@ class TcpSyncManager(
                 }
                 "RESYNC_REQUIRED" -> {
                     Log.w(TAG, "⚠️ 服务器要求全量重建：$data")
-                    val deviceId = getDeviceId()
-                    syncDao.upsertCursor(
-                        (syncDao.getCursor(deviceId) ?: SyncDeviceCursor(deviceId = deviceId)).copy(
-                            firstFullSyncDone = false,
-                            updatedAt = System.currentTimeMillis(),
-                        )
-                    )
+                    resetSyncCursorForFullResync(getDeviceId())
                     _messageChannel.send("服务器要求全量重建，下次连接执行首次全量：$data")
                 }
                 "CONFIG_NO_CHANGE" -> {
@@ -938,10 +1429,24 @@ class TcpSyncManager(
         val ackKey = "$dataType|$billOrSourceId"
         val deferred = pendingAckMap.remove(ackKey)
         if (deferred == null) {
-            Log.w(TAG, "⚠️ ACK未命中待确认项：$ackKey（可能已超时或注册竞态）")
+            Log.w(TAG, "⚠️ ACK未命中待确认项：$ackKey（可能已超时，尝试迟到回写）")
+            if (success) {
+                scope.launch { handleLateAckSuccess(dataType, billOrSourceId) }
+            }
             return
         }
         deferred.complete(success)
+    }
+
+    private suspend fun handleLateAckSuccess(dataType: String, sourceRecordId: String) {
+        Log.i(TAG, "📥 处理迟到 ACK：$dataType $sourceRecordId")
+        when (dataType) {
+            "INBOUND", "SALES" -> updateSyncStatusBySourceRecordId(dataType, sourceRecordId, true)
+            "PACKAGING" -> Log.i(TAG, "包装明细迟到 ACK，整单状态由 syncPackagingBill 统一更新")
+            "ADVANCE", "DEDUCTION", "PRESALE", "PRESALE_PAYMENT", "PRESALE_OUTBOUND", "LEDGER" ->
+                updateSyncStatusBySourceRecordId(dataType, sourceRecordId, true)
+            else -> Log.d(TAG, "迟到 ACK 无需回写：$dataType")
+        }
     }
 
     private suspend fun updateSyncStatusBySourceRecordId(dataType: String, sourceRecordId: String, success: Boolean) {
@@ -967,13 +1472,39 @@ class TcpSyncManager(
                         } ?: Log.w(TAG, "⚠️ SALES未找到本地单据：source=$sourceRecordId, key=$localKey, billNo=$billNo")
                     }
                     "PACKAGING" -> {
-                        val billNo = normalizeBillNoFromLocalKey(localKey)
-                        database.packagingBillDao().getBillByNo(billNo)?.let {
-                            database.packagingBillDao().updateSyncStatus(it.id, success)
-                        } ?: Log.w(TAG, "⚠️ PACKAGING未找到本地单据：source=$sourceRecordId, key=$localKey, billNo=$billNo")
+                        // 整单 isSynced 仅由 syncPackagingBill 全部明细成功后更新
+                        Log.d(TAG, "PACKAGING 逐行 ACK 已收到，暂不更新整单状态：$sourceRecordId")
                     }
                     "ADVANCE" -> localKey.toLongOrNull()?.let { database.advanceDao().updateSyncStatus(it, if (success) 1 else 0) }
                     "DEDUCTION" -> localKey.toLongOrNull()?.let { database.deductionDao().updateSyncStatus(it, if (success) 1 else 0) }
+                    "PRESALE" -> {
+                        database.preSaleBillDao().getBillBySourceRecordId(sourceRecordId)?.let {
+                            database.preSaleBillDao().updateSyncStatus(it.id, if (success) 1 else 0)
+                        } ?: localKey.toLongOrNull()?.let {
+                            database.preSaleBillDao().updateSyncStatus(it, if (success) 1 else 0)
+                        }
+                    }
+                    "PRESALE_PAYMENT" -> {
+                        database.paymentRecordDao().getBySourceRecordId(sourceRecordId)?.let {
+                            database.paymentRecordDao().updateSyncStatus(it.id, if (success) 1 else 0)
+                        } ?: localKey.toLongOrNull()?.let {
+                            database.paymentRecordDao().updateSyncStatus(it, if (success) 1 else 0)
+                        }
+                    }
+                    "PRESALE_OUTBOUND" -> {
+                        database.outboundRecordDao().getBySourceRecordId(sourceRecordId)?.let {
+                            database.outboundRecordDao().updateSyncStatus(it.id, if (success) 1 else 0)
+                        } ?: localKey.toLongOrNull()?.let {
+                            database.outboundRecordDao().updateSyncStatus(it, if (success) 1 else 0)
+                        }
+                    }
+                    "LEDGER" -> localKey.toLongOrNull()?.let {
+                        database.ledgerEntryDao().updateSyncStatus(
+                            it,
+                            if (success) 1 else 0,
+                            if (success) System.currentTimeMillis() else null
+                        )
+                    }
                     else -> Log.w(TAG, "未知 source_record_id 数据类型：$dataType")
                 }
                 Log.d(TAG, "💾 已按 source_record_id 回写状态：$sourceRecordId -> ${if (success) "成功" else "失败"}")
@@ -986,8 +1517,13 @@ class TcpSyncManager(
     private fun parseSourceRecordId(sourceRecordId: String): Triple<String, String, String>? {
         if (!sourceRecordId.startsWith("SRC_")) return null
         val body = sourceRecordId.removePrefix("SRC_")
-        val marker = "_INBOUND_"
+        val marker = "_PRESALE_OUTBOUND_"
             .takeIf { body.contains(it) }
+            ?: "_PRESALE_PAYMENT_"
+            .takeIf { body.contains(it) }
+            ?: "_PRESALE_".takeIf { body.contains(it) }
+            ?: "_LEDGER_".takeIf { body.contains(it) }
+            ?: "_INBOUND_".takeIf { body.contains(it) }
             ?: "_SALES_".takeIf { body.contains(it) }
             ?: "_PACKAGING_".takeIf { body.contains(it) }
             ?: "_ADVANCE_".takeIf { body.contains(it) }
@@ -1040,9 +1576,8 @@ class TcpSyncManager(
                             if (existing == null) {
                                 val location = com.pingwei.lengkubao.data.db.entity.Location(
                                     locationName = name,
-                                    locationNo = "",
                                     enabled = true,
-                                    syncStatus = 1
+                                    syncStatus = 1,
                                 )
                                 database.locationDao().insert(location)
                                 locationCount++
@@ -1068,9 +1603,8 @@ class TcpSyncManager(
                             if (existing == null) {
                                 val operator = com.pingwei.lengkubao.data.db.entity.Operator(
                                     name = name,
-                                    operatorNo = "",
                                     enabled = true,
-                                    syncStatus = 1
+                                    syncStatus = 1,
                                 )
                                 database.operatorDao().insert(operator)
                                 handlerCount++
@@ -1086,35 +1620,32 @@ class TcpSyncManager(
 
                     val clientsArray = dataObject.getAsJsonArray("clients")
                     if (clientsArray != null) {
-                        var clientCount = 0
+                        val syncedCodes = mutableListOf<String>()
                         for (i in 0 until clientsArray.size()) {
                             val clientElement = clientsArray.get(i)
                             val clientObj = clientElement.asJsonObject
                             val code = clientObj.get("code")?.asString ?: continue
                             val name = clientObj.get("name")?.asString ?: continue
                             val phone = clientObj.get("phone")?.asString ?: ""
+                            val enabled = resolveEnabledFromPayload(clientObj)
+                            val customerType = resolveCustomerTypeFromPayload(code, clientObj)
 
-                            val existing = database.customerDao().getByCustomerNo(code)
-                            if (existing != null) {
-                                database.customerDao().updateCustomer(
-                                    existing.id,
-                                    name,
-                                    phone
-                                )
-                                clientCount++
-                                Log.d(TAG, "✅ 更新客户: $name")
-                            } else {
-                                val customer = com.pingwei.lengkubao.data.db.entity.Customer(
-                                    customerNo = code,
-                                    customerName = name,
-                                    phone = phone
-                                )
-                                database.customerDao().insertCustomer(customer)
-                                clientCount++
-                                Log.d(TAG, "✅ 新增客户: $name")
-                            }
+                            upsertCustomerFromRemote(code, name, phone, customerType, enabled)
+                            syncedCodes.add(code)
+                            Log.d(TAG, "✅ 更新客户: $name ($customerType)")
                         }
-                        Log.i(TAG, "✅ 客户数据同步完成: ${clientsArray.size()} 条")
+                        purgeCustomersExceptSnapshot(syncedCodes)
+                        Log.i(TAG, "✅ 客户数据同步完成: ${syncedCodes.size} 条（含卖家/买家，已清理快照外客户）")
+                    }
+
+                    val productsArray = dataObject.getAsJsonArray("product_types")
+                    if (productsArray != null) {
+                        replaceProductsFromSnapshot(productsArray)
+                    }
+
+                    val packTypesArray = dataObject.getAsJsonArray("pack_types")
+                    if (packTypesArray != null) {
+                        replacePackTypesFromSnapshot(packTypesArray)
                     }
 
                     // ✅ 同步PC库存快照（库位 + 型号）
@@ -1172,7 +1703,6 @@ class TcpSyncManager(
                                         productNo = product.productNo,
                                         productName = product.productName,
                                         locationId = location.id,
-                                        locationNo = location.locationNo,
                                         currentQuantity = currentQty,
                                         reservedQuantity = 0,
                                         lastUpdated = now,
@@ -1233,9 +1763,35 @@ class TcpSyncManager(
 
                         if (snapshots.isNotEmpty()) {
                             database.pcInboundDailySnapshotDao().upsertAll(snapshots)
+                            com.pingwei.lengkubao.service.CustomerInboundStockBackfill(database)
+                                .refreshFromPcSnapshots()
                         }
 
                         Log.i(TAG, "✅ PC入库统计快照同步完成: ${inboundDailyArray.size()} 条，应用 $appliedCount 条，跳过 $skippedCount 条")
+                    }
+
+                    val presaleBillsArray = dataObject.getAsJsonArray("presale_bills")
+                    if (presaleBillsArray != null) {
+                        var presaleApplied = 0
+                        for (i in 0 until presaleBillsArray.size()) {
+                            val billPayload = presaleBillsArray.get(i).asJsonObject
+                            if (preSaleSyncApplier.applyBillPayload(billPayload, 0L)) {
+                                presaleApplied++
+                            }
+                        }
+                        Log.i(TAG, "✅ 预售单全量同步完成: ${presaleBillsArray.size()} 条，应用 $presaleApplied 条")
+                    }
+
+                    val presalePaymentsArray = dataObject.getAsJsonArray("presale_payments")
+                    if (presalePaymentsArray != null) {
+                        var paymentApplied = 0
+                        for (i in 0 until presalePaymentsArray.size()) {
+                            val paymentPayload = presalePaymentsArray.get(i).asJsonObject
+                            if (preSaleSyncApplier.applyPaymentPayload(paymentPayload, 0L)) {
+                                paymentApplied++
+                            }
+                        }
+                        Log.i(TAG, "✅ 预售收款全量同步完成: ${presalePaymentsArray.size()} 条，应用 $paymentApplied 条")
                     }
 
                     val clientsCount = clientsArray?.size() ?: 0
@@ -1406,7 +1962,9 @@ class TcpSyncManager(
                 val customerMap = mapOf(
                     "code" to customer.customerNo,
                     "name" to customer.customerName,
-                    "phone" to (customer.phone ?: "")
+                    "phone" to (customer.phone ?: ""),
+                    "customer_type" to customer.customerType,
+                    "enabled" to customer.enabled
                 )
                 val json = gson.toJson(customerMap)
                 sendMessage("CUSTOMER|$json")
@@ -1573,27 +2131,315 @@ class TcpSyncManager(
         }
     }
 
-    /**
-     * 预售单同步桩（待 PC 端对接，暂不发送）
-     */
     suspend fun syncPreSaleBill(billId: Long): Boolean {
         return withContext(Dispatchers.IO) {
-            Log.i(TAG, "ℹ️ 预售单同步待 PC 端对接，billId=$billId（本地保留 syncStatus=0）")
-            false
+            try {
+                if (!canSyncPresaleData()) {
+                    val warnMsg = "预售单同步跳过：年份未对齐"
+                    Log.w(TAG, "⚠️ $warnMsg")
+                    _syncState.value = SyncState.Failed(warnMsg)
+                    _messageChannel.send(warnMsg)
+                    return@withContext false
+                }
+                _syncState.value = SyncState.Syncing("预售单")
+                var bill = database.preSaleBillDao().getBillById(billId)
+                var items = database.preSaleItemDao().getItemsByBillId(billId)
+
+                if (bill != null && items.isNotEmpty()) {
+                    var sourceRecordId = bill.sourceRecordId
+                    if (sourceRecordId.isNullOrBlank()) {
+                        sourceRecordId = SourceRecordIdUtils.buildPresaleBill(billId, context)
+                        database.preSaleBillDao().updateSourceIdentity(
+                            billId,
+                            sourceRecordId,
+                            SourceRecordIdUtils.getDeviceId(context),
+                        )
+                        bill = database.preSaleBillDao().getBillById(billId) ?: bill
+                    }
+                    val itemsJson = items.map { item ->
+                        mapOf(
+                            "spec" to item.productName,
+                            "quantity" to item.quantity.toString(),
+                            "shipped_quantity" to item.shippedQuantity.toString(),
+                            "unit_price" to item.salePrice.toString(),
+                            "total_amount" to item.amount.toString()
+                        )
+                    }
+                    val billMap = mutableMapOf<String, Any?>(
+                        "bill_no" to bill.billNo,
+                        "buyer_code" to bill.buyerNo,
+                        "buyer_name" to bill.buyerName,
+                        "location" to bill.locationName,
+                        "sale_mode" to bill.saleMode,
+                        "bill_status" to bill.status,
+                        "total_amount" to bill.totalAmount.toString(),
+                        "paid_amount" to bill.paidAmount.toString(),
+                        "handler" to bill.operatorName,
+                        "remark" to bill.remark,
+                        "date" to dateFormat.format(java.util.Date(bill.createTime)),
+                        "items" to itemsJson,
+                        "source_device_id" to (bill.sourceDeviceId ?: SourceRecordIdUtils.getDeviceId(context)),
+                        "source_record_id" to sourceRecordId,
+                    )
+                    if (FiscalYearManager.isInitialized) {
+                        billMap["fiscal_year"] = FiscalYearManager.activeYear
+                    }
+                    val json = gson.toJson(billMap)
+                    Log.i(TAG, "📤 上传预售单 ${bill.billNo} mode=${bill.saleMode} status=${bill.status}")
+                    val contentKey = "${bill.saleMode}|${bill.status}|${bill.paidAmount}"
+                    val success = sendMessageAndWaitForAck("PRESALE", json, sourceRecordId, contentKey)
+
+                    if (success) {
+                        database.preSaleBillDao().updateSyncStatus(billId, 1)
+                        val successMsg = "预售单[${bill.billNo}]同步成功 mode=${bill.saleMode}"
+                        Log.i(TAG, "✅ $successMsg")
+                        _syncState.value = SyncState.Success(successMsg)
+                        _messageChannel.send(successMsg)
+                        return@withContext true
+                    } else {
+                        database.preSaleBillDao().updateSyncStatus(billId, 0)
+                        val failMsg = "预售单[${bill.billNo}]同步失败"
+                        Log.e(TAG, "❌ $failMsg")
+                        _syncState.value = SyncState.Failed(failMsg)
+                        _messageChannel.send(failMsg)
+                        return@withContext false
+                    }
+                } else {
+                    val warnMsg = "预售单ID:$billId 不存在或无明细，跳过同步"
+                    Log.w(TAG, "⚠️ $warnMsg")
+                    _syncState.value = SyncState.Failed(warnMsg)
+                    _messageChannel.send(warnMsg)
+                    return@withContext false
+                }
+            } catch (e: Exception) {
+                val errorMsg = "同步预售单失败：${e.message}"
+                Log.e(TAG, "❌ $errorMsg", e)
+                _syncState.value = SyncState.Failed(errorMsg)
+                _messageChannel.send(errorMsg)
+                return@withContext false
+            }
         }
     }
 
-    /**
-     * 预售收款同步桩（待 PC 端对接，暂不发送）
-     */
     suspend fun syncPreSalePayment(paymentId: Long): Boolean {
         return withContext(Dispatchers.IO) {
-            Log.i(TAG, "ℹ️ 预售收款同步待 PC 端对接，paymentId=$paymentId")
-            false
+            try {
+                if (!canSyncPresaleData()) {
+                    val warnMsg = "预售收款同步跳过：年份未对齐"
+                    Log.w(TAG, "⚠️ $warnMsg")
+                    _syncState.value = SyncState.Failed(warnMsg)
+                    _messageChannel.send(warnMsg)
+                    return@withContext false
+                }
+                _syncState.value = SyncState.Syncing("预售收款")
+                val payment = database.paymentRecordDao().getById(paymentId)
+                if (payment == null) {
+                    val warnMsg = "预售收款ID:$paymentId 不存在，跳过同步"
+                    Log.w(TAG, "⚠️ $warnMsg")
+                    _syncState.value = SyncState.Failed(warnMsg)
+                    _messageChannel.send(warnMsg)
+                    return@withContext false
+                }
+
+                val bill = database.preSaleBillDao().getBillById(payment.billId)
+                if (bill == null) {
+                    val warnMsg = "预售收款关联单据不存在：billId=${payment.billId}"
+                    Log.w(TAG, "⚠️ $warnMsg")
+                    _syncState.value = SyncState.Failed(warnMsg)
+                    _messageChannel.send(warnMsg)
+                    return@withContext false
+                }
+
+                val sourceRecordId = payment.sourceRecordId?.takeIf { it.isNotBlank() }
+                    ?: SourceRecordIdUtils.buildPresalePayment(paymentId, context).also { built ->
+                        database.paymentRecordDao().updateSourceIdentity(
+                            paymentId,
+                            built,
+                            SourceRecordIdUtils.getDeviceId(context),
+                        )
+                    }
+                val paymentMap = mutableMapOf<String, Any?>(
+                    "bill_no" to bill.billNo,
+                    "buyer_code" to bill.buyerNo,
+                    "amount" to payment.amount.toString(),
+                    "pay_method" to payment.payMethod,
+                    "pay_time" to payment.payTime.toString(),
+                    "remark" to payment.remark,
+                    "source_device_id" to (payment.sourceDeviceId ?: SourceRecordIdUtils.getDeviceId(context)),
+                    "source_record_id" to sourceRecordId,
+                )
+                if (FiscalYearManager.isInitialized) {
+                    paymentMap["fiscal_year"] = FiscalYearManager.activeYear
+                }
+                val json = gson.toJson(paymentMap)
+                val success = sendMessageAndWaitForAck("PRESALE_PAYMENT", json, sourceRecordId)
+
+                if (success) {
+                    database.paymentRecordDao().updateSyncStatus(paymentId, 1)
+                    val successMsg = "预售收款[${bill.billNo} ${payment.amount}]同步成功"
+                    Log.i(TAG, "✅ $successMsg")
+                    _syncState.value = SyncState.Success(successMsg)
+                    _messageChannel.send(successMsg)
+                    return@withContext true
+                } else {
+                    val failMsg = "预售收款[${bill.billNo}]同步失败"
+                    Log.e(TAG, "❌ $failMsg")
+                    _syncState.value = SyncState.Failed(failMsg)
+                    _messageChannel.send(failMsg)
+                    return@withContext false
+                }
+            } catch (e: Exception) {
+                val errorMsg = "同步预售收款失败：${e.message}"
+                Log.e(TAG, "❌ $errorMsg", e)
+                _syncState.value = SyncState.Failed(errorMsg)
+                _messageChannel.send(errorMsg)
+                return@withContext false
+            }
         }
     }
 
-    suspend fun syncPackagingBill(billId: Long): Boolean {
+    suspend fun syncPreSaleOutbound(outboundId: Long): Boolean {
+        return withContext(Dispatchers.IO) {
+            try {
+                if (!canSyncPresaleData()) {
+                    val warnMsg = "预售出库同步跳过：年份未对齐"
+                    Log.w(TAG, "⚠️ $warnMsg")
+                    _syncState.value = SyncState.Failed(warnMsg)
+                    _messageChannel.send(warnMsg)
+                    return@withContext false
+                }
+                _syncState.value = SyncState.Syncing("预售出库")
+                val record = database.outboundRecordDao().getById(outboundId)
+                if (record == null) {
+                    val warnMsg = "预售出库ID:$outboundId 不存在，跳过同步"
+                    Log.w(TAG, "⚠️ $warnMsg")
+                    _syncState.value = SyncState.Failed(warnMsg)
+                    _messageChannel.send(warnMsg)
+                    return@withContext false
+                }
+
+                val bill = database.preSaleBillDao().getBillById(record.billId)
+                if (bill == null) {
+                    val warnMsg = "预售出库关联单据不存在：billId=${record.billId}"
+                    Log.w(TAG, "⚠️ $warnMsg")
+                    _syncState.value = SyncState.Failed(warnMsg)
+                    _messageChannel.send(warnMsg)
+                    return@withContext false
+                }
+
+                val recordItems = database.outboundRecordItemDao().getByRecordId(outboundId)
+                val sourceRecordId = record.sourceRecordId?.takeIf { it.isNotBlank() }
+                    ?: SourceRecordIdUtils.buildPresaleOutbound(outboundId, context).also { built ->
+                        database.outboundRecordDao().updateSourceIdentity(
+                            outboundId,
+                            built,
+                            SourceRecordIdUtils.getDeviceId(context),
+                        )
+                    }
+
+                val itemsJson = recordItems.map { item ->
+                    mapOf(
+                        "spec" to item.productName,
+                        "product_no" to item.productNo,
+                        "quantity" to item.quantity.toString(),
+                        "unit" to item.unit,
+                    )
+                }
+                val outboundMap = mutableMapOf<String, Any?>(
+                    "bill_no" to bill.billNo,
+                    "buyer_code" to bill.buyerNo,
+                    "ship_time" to record.shipTime.toString(),
+                    "remark" to record.remark,
+                    "bill_status" to bill.status,
+                    "sale_mode" to bill.saleMode,
+                    "items" to itemsJson,
+                    "source_device_id" to (record.sourceDeviceId ?: SourceRecordIdUtils.getDeviceId(context)),
+                    "source_record_id" to sourceRecordId,
+                )
+                if (FiscalYearManager.isInitialized) {
+                    outboundMap["fiscal_year"] = FiscalYearManager.activeYear
+                }
+                val json = gson.toJson(outboundMap)
+                val success = sendMessageAndWaitForAck("PRESALE_OUTBOUND", json, sourceRecordId)
+
+                if (success) {
+                    database.outboundRecordDao().updateSyncStatus(outboundId, 1)
+                    val successMsg = "预售出库[${bill.billNo}]同步成功"
+                    Log.i(TAG, "✅ $successMsg")
+                    _syncState.value = SyncState.Success(successMsg)
+                    _messageChannel.send(successMsg)
+                    return@withContext true
+                } else {
+                    val failMsg = "预售出库[${bill.billNo}]同步失败"
+                    Log.e(TAG, "❌ $failMsg")
+                    _syncState.value = SyncState.Failed(failMsg)
+                    _messageChannel.send(failMsg)
+                    return@withContext false
+                }
+            } catch (e: Exception) {
+                val errorMsg = "同步预售出库失败：${e.message}"
+                Log.e(TAG, "❌ $errorMsg", e)
+                _syncState.value = SyncState.Failed(errorMsg)
+                _messageChannel.send(errorMsg)
+                return@withContext false
+            }
+        }
+    }
+
+    suspend fun syncLedgerEntry(entryId: Long): Boolean {
+        return withContext(Dispatchers.IO) {
+            try {
+                _syncState.value = SyncState.Syncing("收支流水")
+                val entry = database.ledgerEntryDao().getById(entryId)
+                if (entry == null) {
+                    val warnMsg = "收支流水ID:$entryId 不存在，跳过同步"
+                    Log.w(TAG, "⚠️ $warnMsg")
+                    _syncState.value = SyncState.Failed(warnMsg)
+                    _messageChannel.send(warnMsg)
+                    return@withContext false
+                }
+
+                val sourceRecordId = buildSourceRecordId("LEDGER", entryId.toString())
+                val entryMap = mapOf(
+                    "entry_no" to entry.entryNo,
+                    "type" to entry.type,
+                    "category_id" to entry.categoryId.toString(),
+                    "category_name" to entry.categoryName,
+                    "amount" to entry.amount.toString(),
+                    "entry_date" to entry.entryDate,
+                    "remark" to entry.remark,
+                    "status" to entry.status.toString(),
+                    "source_device_id" to getDeviceId(),
+                    "source_record_id" to sourceRecordId
+                )
+                val json = gson.toJson(entryMap)
+                val success = sendMessageAndWaitForAck("LEDGER", json, sourceRecordId)
+
+                if (success) {
+                    database.ledgerEntryDao().updateSyncStatus(entryId, 1, System.currentTimeMillis())
+                    val successMsg = "收支流水[${entry.entryNo}]同步成功"
+                    Log.i(TAG, "✅ $successMsg")
+                    _syncState.value = SyncState.Success(successMsg)
+                    _messageChannel.send(successMsg)
+                    return@withContext true
+                } else {
+                    val failMsg = "收支流水[${entry.entryNo}]同步失败"
+                    Log.e(TAG, "❌ $failMsg")
+                    _syncState.value = SyncState.Failed(failMsg)
+                    _messageChannel.send(failMsg)
+                    return@withContext false
+                }
+            } catch (e: Exception) {
+                val errorMsg = "同步收支流水失败：${e.message}"
+                Log.e(TAG, "❌ $errorMsg", e)
+                _syncState.value = SyncState.Failed(errorMsg)
+                _messageChannel.send(errorMsg)
+                return@withContext false
+            }
+        }
+    }
+
+    suspend fun syncPackagingBill(billId: Long): PackagingSyncResult {
         return withContext(Dispatchers.IO) {
             try {
                 _syncState.value = SyncState.Syncing("包装单")
@@ -1604,9 +2450,13 @@ class TcpSyncManager(
                     var successCount = 0
                     var failCount = 0
                     val failedItems = mutableListOf<String>()
+                    val duplicateNotices = linkedSetOf<String>()
+                    var lastFailureMessage: String? = null
 
-                    items.forEachIndexed { index, item ->
-                        val sourceRecordId = buildSourceRecordId("PACKAGING", "${bill.billNo}_${index}")
+                    items.forEach { item ->
+                        val itemKey = if (item.itemId > 0L) item.itemId else item.packagingType
+                        val sourceRecordId = buildSourceRecordId("PACKAGING", "${billId}_${itemKey}")
+                        val ackKey = "PACKAGING|$sourceRecordId"
                         val itemMap = mutableMapOf(
                             "order_no" to bill.billNo,
                             "client_code" to bill.customerNo,
@@ -1633,43 +2483,54 @@ class TcpSyncManager(
 
                         if (success) {
                             successCount++
+                            packagingIdempotentNotices.remove(ackKey)?.let { duplicateNotices.add(it) }
                             Log.d(TAG, "📤 包装明细确认成功：${item.packagingType} x${item.quantity}")
                         } else {
                             failCount++
                             failedItems.add(item.packagingType)
+                            packagingAckFailureMessages.remove(ackKey)?.let { lastFailureMessage = it }
                             Log.e(TAG, "❌ 包装明细确认失败：${item.packagingType} x${item.quantity}")
                         }
                         delay(50)
                     }
 
-                    // ✅ 所有明细都成功后，才更新整单状态
                     if (failCount == 0) {
                         database.packagingBillDao().updateSyncStatus(billId, true)
+                        val duplicateSummary = duplicateNotices.takeIf { it.isNotEmpty() }?.joinToString("\n\n")
                         val successMsg = "包装单${bill.billNo}同步成功，标记=${bill.packagingTypeFlag}（${successCount}条明细）"
                         Log.i(TAG, "✅ $successMsg")
                         _messageChannel.send(successMsg)
                         _syncState.value = SyncState.Success(successMsg)
-                        return@withContext true
+                        return@withContext PackagingSyncResult(
+                            success = true,
+                            duplicateNotice = duplicateSummary,
+                        )
                     } else {
-                        val failMsg = "包装单${bill.billNo}同步部分失败：成功${successCount}条，失败${failCount}条（${failedItems.joinToString()}）"
+                        clearConfirmedItemsForPackagingBill(billId)
+                        database.packagingBillDao().updateSyncStatus(billId, false)
+                        val failMsg = lastFailureMessage
+                            ?: "包装单${bill.billNo}同步部分失败：成功${successCount}条，失败${failCount}条（${failedItems.joinToString()}）"
                         Log.e(TAG, "❌ $failMsg")
                         _syncState.value = SyncState.Failed(failMsg)
                         _messageChannel.send(failMsg)
-                        return@withContext false
+                        return@withContext PackagingSyncResult(
+                            success = false,
+                            errorMessage = failMsg,
+                        )
                     }
                 } else {
                     val warnMsg = "包装单ID:$billId 不存在或无明细，跳过同步"
                     Log.w(TAG, "⚠️ $warnMsg")
                     _syncState.value = SyncState.Failed(warnMsg)
                     _messageChannel.send(warnMsg)
-                    return@withContext false
+                    return@withContext PackagingSyncResult(success = false, errorMessage = warnMsg)
                 }
             } catch (e: Exception) {
                 val errorMsg = "同步包装单失败：${e.message}"
                 Log.e(TAG, "❌ $errorMsg", e)
                 _syncState.value = SyncState.Failed(errorMsg)
                 _messageChannel.send(errorMsg)
-                return@withContext false
+                return@withContext PackagingSyncResult(success = false, errorMessage = errorMsg)
             }
         }
     }
@@ -1849,15 +2710,28 @@ class TcpSyncManager(
     suspend fun checkUnsyncedConfigs(): Map<String, Int> {
         return withContext(Dispatchers.IO) {
             try {
-                val unsyncedLocations = database.locationDao().getAllSimple().count { it.syncStatus == 0 }
-                val unsyncedOperators = database.operatorDao().getAllSimple().count { it.syncStatus == 0 }
-                val unsyncedCustomers = database.customerDao().getAllSimple().count { it.syncStatus == 0 }
+                val unsyncedCustomers = pendingConfigCount("CUSTOMER") {
+                    database.customerDao().getAllSimple().count { it.syncStatus == 0 }
+                }
+                val unsyncedLocations = pendingConfigCount("LOCATION") {
+                    database.locationDao().getAllSimple().count { it.syncStatus == 0 }
+                }
+                val unsyncedOperators = pendingConfigCount("OPERATOR") {
+                    database.operatorDao().getAllSimple().count { it.syncStatus == 0 }
+                }
+                val unsyncedProducts = syncDao.countPendingOpsByEntityType("PRODUCT")
+                val unsyncedPackTypes = syncDao.countPendingOpsByEntityType("PACK_TYPE")
 
                 val result = mapOf(
                     "库位" to unsyncedLocations,
                     "经手人" to unsyncedOperators,
                     "客户" to unsyncedCustomers,
-                    "总计" to (unsyncedLocations + unsyncedOperators + unsyncedCustomers)
+                    "商品型号" to unsyncedProducts,
+                    "包装类型" to unsyncedPackTypes,
+                    "总计" to (
+                        unsyncedLocations + unsyncedOperators + unsyncedCustomers +
+                            unsyncedProducts + unsyncedPackTypes
+                        ),
                 )
 
                 Log.i(TAG, "📊 未同步基础配置检查结果：$result")
@@ -1869,8 +2743,17 @@ class TcpSyncManager(
         }
     }
 
-    suspend fun autoBidirectionalDeltaSyncOnConnect() {
+    private suspend fun pendingConfigCount(entityType: String, legacyCount: suspend () -> Int): Int {
+        val oplogCount = syncDao.countPendingOpsByEntityType(entityType)
+        return maxOf(oplogCount, legacyCount())
+    }
+
+    suspend fun autoBidirectionalDeltaSyncOnConnect(skipHelloSync: Boolean = false) {
         withContext(Dispatchers.IO) {
+            if (!isConnected.get() || !isRegistered.get()) {
+                Log.w(TAG, "增量同步跳过：未连接或未注册")
+                return@withContext
+            }
             try {
                 val deviceId = getDeviceId()
                 val now = System.currentTimeMillis()
@@ -1880,32 +2763,20 @@ class TcpSyncManager(
                 )
                 syncDao.upsertCursor(cursor)
 
-                val helloPayload = gson.toJson(
-                    mapOf(
-                        "device_id" to deviceId,
-                        "first_full_sync_done" to cursor.firstFullSyncDone,
-                        "last_acked_seq" to cursor.lastAckedSeq,
-                        "supports_delta" to true,
-                        "mode" to "LWW_COMMIT_SEQ",
-                    )
-                )
-                sendMessage("HELLO_SYNC|$helloPayload")
-
-                if (!cursor.firstFullSyncDone) {
-                    Log.i(TAG, "🔄 首次连接，执行全量双向同步")
-                    _syncState.value = SyncState.Syncing("首次双向全量同步")
-                    syncAllConfigs(onResult = { success, msg ->
-                        Log.i(TAG, "首次全量基础配置结果: success=$success, msg=$msg")
-                    })
-                    syncDao.updateFirstFullSyncDone(deviceId, true, now)
+                if (!skipHelloSync) {
+                    if (!ensureSyncYearAligned()) {
+                        return@withContext
+                    }
+                    if (!isConnected.get() || !isRegistered.get()) {
+                        return@withContext
+                    }
                 }
+
+                val refreshedCursor = syncDao.getCursor(deviceId) ?: cursor
+                val latestAckedSeq = ensureDownstreamConfigAligned(deviceId, refreshedCursor)
 
                 val uploaded = uploadPendingConfigOps(deviceId)
-                val latestAckedSeq = pullAndApplyDelta(deviceId, cursor.lastAckedSeq)
-                if (latestAckedSeq != null) {
-                    syncDao.updateLastAckedSeq(deviceId, latestAckedSeq, System.currentTimeMillis())
-                }
-                val successMsg = "双向增量同步完成：上行${uploaded}条，最新序号=${latestAckedSeq ?: cursor.lastAckedSeq}"
+                val successMsg = "双向增量同步完成：下行至$latestAckedSeq，上行${uploaded}条"
                 _syncState.value = SyncState.Success(successMsg)
                 _messageChannel.send(successMsg)
                 Log.i(TAG, "✅ $successMsg")
@@ -1918,9 +2789,133 @@ class TcpSyncManager(
         }
     }
 
+    suspend fun pullFullConfigFromPc(
+        onProgress: ((current: Int, total: Int, type: String) -> Unit)? = null,
+        onResult: ((success: Boolean, message: String) -> Unit)? = null,
+    ) {
+        withContext(Dispatchers.IO) {
+            if (!isConnected.get() || !isRegistered.get()) {
+                val err = "未连接或未注册，请先连接电脑"
+                _syncState.value = SyncState.Failed(err)
+                onResult?.invoke(false, err)
+                return@withContext
+            }
+            try {
+                val deviceId = getDeviceId()
+                _syncState.value = SyncState.Syncing("从电脑全量拉取基础配置")
+                uploadPendingConfigOps(deviceId)
+                val fullOk = pullFullSyncFromServer(skipUpload = true, onProgress = onProgress)
+                if (!fullOk) {
+                    val err = "全量拉取失败，请检查连接后重试"
+                    _syncState.value = SyncState.Failed(err)
+                    onResult?.invoke(false, err)
+                    return@withContext
+                }
+                syncDao.updateFirstFullSyncDone(deviceId, true, System.currentTimeMillis())
+                val baselineSeq = resolveFullSyncBaselineSeq()
+                if (baselineSeq > 0L) {
+                    syncDao.updateLastAckedSeq(deviceId, baselineSeq, System.currentTimeMillis())
+                }
+                val ack = pullAndApplyDelta(deviceId, baselineSeq.coerceAtLeast(0L))
+                if (ack != null) {
+                    syncDao.updateLastAckedSeq(deviceId, ack, System.currentTimeMillis())
+                }
+                val msg = "全量配置已与电脑对齐（基线序号=${ack ?: baselineSeq}）"
+                _syncState.value = SyncState.Success(msg)
+                com.pingwei.lengkubao.utils.ConfigSyncStatusNotifier.notifyChanged()
+                onResult?.invoke(true, msg)
+            } catch (e: Exception) {
+                val err = "全量拉取失败：${e.message}"
+                _syncState.value = SyncState.Failed(err)
+                onResult?.invoke(false, err)
+            }
+        }
+    }
+
+    suspend fun bidirectionalConfigSync(
+        onResult: ((success: Boolean, message: String) -> Unit)? = null,
+    ) {
+        withContext(Dispatchers.IO) {
+            if (!isConnected.get() || !isRegistered.get()) {
+                val err = "未连接服务器，请先连接"
+                _syncState.value = SyncState.Failed(err)
+                onResult?.invoke(false, err)
+                return@withContext
+            }
+            try {
+                val deviceId = getDeviceId()
+                val cursor = syncDao.getCursor(deviceId) ?: SyncDeviceCursor(deviceId = deviceId)
+                syncDao.upsertCursor(cursor)
+
+                _syncState.value = SyncState.Syncing("双向增量同步配置")
+                var latestAckedSeq = ensureDownstreamConfigAligned(deviceId, cursor)
+                val uploaded = uploadPendingConfigOps(deviceId)
+                latestAckedSeq = pullAndApplyDelta(
+                    deviceId,
+                    syncDao.getCursor(deviceId)?.lastAckedSeq ?: latestAckedSeq,
+                ) ?: recoverDownstreamConfigFromPc(deviceId) ?: latestAckedSeq
+                if (latestAckedSeq != null) {
+                    syncDao.updateLastAckedSeq(deviceId, latestAckedSeq, System.currentTimeMillis())
+                }
+                val msg = "配置同步完成：上行${uploaded}条，最新序号=${latestAckedSeq ?: cursor.lastAckedSeq}"
+                _syncState.value = SyncState.Success(msg)
+                _messageChannel.send(msg)
+                onResult?.invoke(true, msg)
+            } catch (e: Exception) {
+                val err = "配置同步失败：${e.message}"
+                _syncState.value = SyncState.Failed(err)
+                onResult?.invoke(false, err)
+            }
+        }
+    }
+
+    private suspend fun tryPullConfigViaCrsql(deviceId: String): Boolean {
+        if (!CrsqlHelper.isAvailable || !isConnected.get() || !isRegistered.get()) return false
+        return try {
+            val since = syncDao.getCursor(deviceId)?.lastAckedSeq ?: 0L
+            val req = gson.toJson(mapOf("since_db_version" to since))
+            val resp = sendMessageAndWaitForCommand("CONFIG_PULL|$req", "CONFIG_PULL_RESP", 30000L)
+                ?: return false
+            if (!looksLikeCompleteJson(resp)) return false
+            val obj = JsonParser.parseString(resp).asJsonObject
+            val available = obj.get("available")?.asBoolean ?: false
+            if (!available) return false
+            val changes = obj.getAsJsonArray("changes")
+            Log.i(TAG, "📥 CONFIG_PULL cr-sqlite 收到 ${changes?.size() ?: 0} 条变更")
+            true
+        } catch (e: Exception) {
+            Log.w(TAG, "⚠️ CONFIG_PULL cr-sqlite 失败: ${e.message}")
+            false
+        }
+    }
+
+    suspend fun pushPendingConfigOps(): Int {
+        if (!isConnected.get() || !isRegistered.get()) return 0
+        return uploadPendingConfigOps(getDeviceId())
+    }
+
+    private suspend fun markConfigSyncedAfterPush(op: SyncLocalOpLog) {
+        when (op.entityType) {
+            "CUSTOMER" -> database.customerDao().getByCustomerNo(op.entityKey)?.let {
+                database.customerDao().updateSyncStatus(it.id, 1)
+            }
+            "LOCATION" -> database.locationDao().getByLocationName(op.entityKey)?.let {
+                database.locationDao().updateSyncStatus(it.id, 1)
+            }
+            "OPERATOR" -> database.operatorDao().getByOperatorName(op.entityKey)?.let {
+                database.operatorDao().updateSyncStatus(it.id, 1)
+            }
+            "PRODUCT" -> database.productDao().getByProductNo(op.entityKey)?.let {
+                database.productDao().updateSyncStatus(it.id, 1)
+            }
+            "PACK_TYPE" -> { /* 无 syncStatus 字段，未同步由 oplog 统计 */ }
+        }
+    }
+
     private suspend fun uploadPendingConfigOps(deviceId: String): Int {
         val ops = syncDao.getPendingLocalOps(500)
         if (ops.isEmpty()) return 0
+        val opByOriginId = ops.associateBy { it.originOpId }
         val payload = ops.map {
             mapOf(
                 "entity_type" to it.entityType,
@@ -1956,17 +2951,145 @@ class TcpSyncManager(
                 val originOpId = ack.get("origin_op_id")?.asString ?: continue
                 val commitSeq = ack.get("commit_seq")?.asLong
                 syncDao.markLocalOpPushed(originOpId, System.currentTimeMillis(), commitSeq)
+                opByOriginId[originOpId]?.let { markConfigSyncedAfterPush(it) }
                 pushedCount++
             }
         }
         if (pushedCount > 0) {
             val maxPushedId = syncDao.getPendingLocalOps(1).firstOrNull()?.id?.minus(1) ?: Long.MAX_VALUE
             syncDao.deletePushedOpsBefore(maxPushedId)
+            com.pingwei.lengkubao.utils.ConfigSyncStatusNotifier.notifyChanged()
         }
         return pushedCount
     }
 
+    private suspend fun needsFullConfigResync(cursor: SyncDeviceCursor): Boolean {
+        if (!cursor.firstFullSyncDone || cursor.lastAckedSeq <= 0L) {
+            return false
+        }
+        val customers = database.customerDao().getAllSimple()
+        val locations = database.locationDao().getAllSimple()
+        val operators = database.operatorDao().getAllSimple()
+        val products = database.productDao().getAll()
+        val packTypes = database.packagingTypeDao().getAll()
+        return (customers.isEmpty() && locations.isEmpty() && operators.isEmpty()) ||
+            (products.isEmpty() && packTypes.isEmpty())
+    }
+
+    private suspend fun resetSyncCursorForFullResync(deviceId: String) {
+        val now = System.currentTimeMillis()
+        syncDao.upsertCursor(
+            (syncDao.getCursor(deviceId) ?: SyncDeviceCursor(deviceId = deviceId)).copy(
+                firstFullSyncDone = false,
+                lastAckedSeq = 0L,
+                updatedAt = now,
+            )
+        )
+        Log.w(TAG, "🔄 已重置同步游标，deviceId=$deviceId")
+    }
+
+    /**
+     * 全量拉取 PC 基础配置并补齐增量；仅在需要时调用。
+     * @return 成功后的 lastAckedSeq，失败返回 null
+     */
+    private suspend fun recoverDownstreamConfigFromPc(deviceId: String): Long? {
+        Log.w(TAG, "⚠️ 尝试全量恢复基础配置，deviceId=$deviceId")
+        resetSyncCursorForFullResync(deviceId)
+        _syncState.value = SyncState.Syncing("从电脑全量恢复基础配置")
+        val fullOk = pullFullSyncFromServer(skipUpload = true)
+        if (!fullOk) {
+            Log.e(TAG, "❌ 全量恢复失败，保留游标以便下次重试")
+            return null
+        }
+        syncDao.updateFirstFullSyncDone(deviceId, true, System.currentTimeMillis())
+        val baselineSeq = resolveFullSyncBaselineSeq()
+        if (baselineSeq > 0L) {
+            syncDao.updateLastAckedSeq(deviceId, baselineSeq, System.currentTimeMillis())
+            Log.i(TAG, "⏭️ 全量恢复基线 seq=$baselineSeq，跳过快照前历史增量")
+        }
+        val ack = pullAndApplyDelta(deviceId, baselineSeq.coerceAtLeast(0L))
+        if (ack != null) {
+            syncDao.updateLastAckedSeq(deviceId, ack, System.currentTimeMillis())
+        }
+        return ack
+    }
+
+    /**
+     * 连接后对齐 PC 下行配置：检测游标异常、首次全量、增量补齐。
+     */
+    private suspend fun ensureDownstreamConfigAligned(
+        deviceId: String,
+        initialCursor: SyncDeviceCursor,
+    ): Long {
+        if (CrsqlHelper.isAvailable) {
+            tryPullConfigViaCrsql(deviceId)
+        }
+
+        var cursor = initialCursor
+        if (needsFullConfigResync(cursor)) {
+            Log.w(TAG, "⚠️ 游标显示已同步但本地无基础数据，触发全量恢复")
+            val recovered = recoverDownstreamConfigFromPc(deviceId)
+            if (recovered != null) {
+                return recovered
+            }
+            cursor = syncDao.getCursor(deviceId) ?: cursor
+        }
+
+        if (!cursor.firstFullSyncDone) {
+            Log.i(TAG, "🔄 首次连接，从电脑拉取基础配置对齐")
+            _syncState.value = SyncState.Syncing("首次从电脑拉取配置")
+            val fullOk = pullFullSyncFromServer(
+                skipUpload = true,
+                onResult = { success, msg ->
+                    Log.i(TAG, "首次拉取配置结果: success=$success, msg=$msg")
+                },
+            )
+            if (fullOk) {
+                syncDao.updateFirstFullSyncDone(deviceId, true, System.currentTimeMillis())
+                val baselineSeq = resolveFullSyncBaselineSeq()
+                if (baselineSeq > 0L) {
+                    syncDao.updateLastAckedSeq(deviceId, baselineSeq, System.currentTimeMillis())
+                    Log.i(TAG, "⏭️ 全量基线已建立，跳过快照前历史增量，baselineSeq=$baselineSeq")
+                }
+                cursor = syncDao.getCursor(deviceId) ?: cursor
+                val ackSeq = pullAndApplyDelta(deviceId, cursor.lastAckedSeq)
+                if (ackSeq != null) {
+                    syncDao.updateLastAckedSeq(deviceId, ackSeq, System.currentTimeMillis())
+                }
+                return ackSeq ?: cursor.lastAckedSeq
+            } else {
+                Log.e(TAG, "❌ 首次全量拉取失败，下次连接将重试")
+                return cursor.lastAckedSeq
+            }
+        }
+
+        var latestAckedSeq = pullAndApplyDelta(deviceId, cursor.lastAckedSeq)
+        if (latestAckedSeq == null) {
+            Log.w(TAG, "⚠️ 增量未补齐（fromSeq=${cursor.lastAckedSeq}），降级全量恢复")
+            latestAckedSeq = recoverDownstreamConfigFromPc(deviceId)
+        }
+        if (latestAckedSeq != null) {
+            syncDao.updateLastAckedSeq(deviceId, latestAckedSeq, System.currentTimeMillis())
+        }
+        return latestAckedSeq ?: cursor.lastAckedSeq
+    }
+
+    private suspend fun getDownstreamDeltaSkipReason(deviceId: String): String? {
+        if (fullSyncInProgress.get()) {
+            return "全量同步进行中"
+        }
+        val cursor = syncDao.getCursor(deviceId)
+        if (cursor != null && !cursor.firstFullSyncDone) {
+            return "首次全量未完成"
+        }
+        return null
+    }
+
     private suspend fun pullAndApplyDelta(deviceId: String, fromSeq: Long): Long? {
+        getDownstreamDeltaSkipReason(deviceId)?.let { reason ->
+            Log.i(TAG, "⏭️ 跳过增量拉取：$reason")
+            return null
+        }
         val req = gson.toJson(mapOf("device_id" to deviceId, "last_acked_seq" to fromSeq))
         val response = sendMessageAndWaitForCommand("PULL_DELTA_REQ|$req", "PULL_DELTA_RESP", 60000L) ?: return null
         if (!looksLikeCompleteJson(response)) {
@@ -1982,8 +3105,15 @@ class TcpSyncManager(
         val toSeq = respObj.get("to_seq")?.asLong ?: fromSeq
         val ops = respObj.getAsJsonArray("ops")
         if (ops == null || ops.size() == 0) {
-            sendMessage("DELTA_APPLY_ACK|${gson.toJson(mapOf("acked_seq" to toSeq))}")
-            return toSeq
+            if (fromSeq >= toSeq) {
+                sendMessage("DELTA_APPLY_ACK|${gson.toJson(mapOf("acked_seq" to toSeq))}")
+                return toSeq
+            }
+            Log.w(
+                TAG,
+                "⚠️ 增量为空但游标落后（fromSeq=$fromSeq, toSeq=$toSeq），不提前 ACK，需全量或重试",
+            )
+            return null
         }
         database.withTransaction {
             syncDao.setSuppressLocalLog(true)
@@ -1997,6 +3127,7 @@ class TcpSyncManager(
             }
         }
         sendMessage("DELTA_APPLY_ACK|${gson.toJson(mapOf("acked_seq" to toSeq))}")
+        com.pingwei.lengkubao.utils.ConfigSyncStatusNotifier.notifyChanged()
         return toSeq
     }
 
@@ -2022,6 +3153,11 @@ class TcpSyncManager(
             "CUSTOMER" -> applyCustomerDelta(opType, payload)
             "LOCATION" -> applyLocationDelta(opType, payload)
             "OPERATOR" -> applyOperatorDelta(opType, payload)
+            "PRODUCT" -> applyProductDelta(opType, payload)
+            "PACK_TYPE" -> applyPackTypeDelta(opType, payload)
+            "PRESALE" -> preSaleSyncApplier.applyBillPayload(payload, commitSeq)
+            "PRESALE_PAYMENT" -> preSaleSyncApplier.applyPaymentPayload(payload, commitSeq)
+            "PRESALE_OUTBOUND" -> preSaleSyncApplier.applyOutboundPayload(payload, commitSeq)
         }
         if (originOpId.isNotBlank()) {
             syncDao.insertAppliedOp(
@@ -2038,11 +3174,31 @@ class TcpSyncManager(
     private suspend fun applyCustomerDelta(opType: String, payload: com.google.gson.JsonObject) {
         val code = payload.get("code")?.asString ?: return
         if (opType == "DELETE") {
-            database.customerDao().getByCustomerNo(code)?.let { database.customerDao().delete(it) }
+            database.customerDao().getByCustomerNo(code)?.let { existing ->
+                database.customerDao().insertCustomer(
+                    existing.copy(
+                        enabled = false,
+                        syncStatus = 1,
+                        updateTime = System.currentTimeMillis(),
+                    ),
+                )
+            }
             return
         }
         val name = payload.get("name")?.asString ?: code
         val phone = payload.get("phone")?.asString ?: ""
+        val customerType = resolveCustomerTypeFromPayload(code, payload)
+        val enabled = resolveEnabledFromPayload(payload)
+        upsertCustomerFromRemote(code, name, phone, customerType, enabled)
+    }
+
+    private suspend fun upsertCustomerFromRemote(
+        code: String,
+        name: String,
+        phone: String,
+        customerType: String,
+        enabled: Boolean,
+    ) {
         val existing = database.customerDao().getByCustomerNo(code)
         if (existing == null) {
             database.customerDao().insertCustomer(
@@ -2050,6 +3206,8 @@ class TcpSyncManager(
                     customerNo = code,
                     customerName = name,
                     phone = phone,
+                    customerType = customerType,
+                    enabled = enabled,
                     updateTime = System.currentTimeMillis(),
                     syncStatus = 1,
                 )
@@ -2059,6 +3217,8 @@ class TcpSyncManager(
                 existing.copy(
                     customerName = name,
                     phone = phone,
+                    customerType = customerType,
+                    enabled = enabled,
                     updateTime = System.currentTimeMillis(),
                     syncStatus = 1,
                 )
@@ -2066,52 +3226,82 @@ class TcpSyncManager(
         }
     }
 
+    private fun resolveCustomerTypeFromPayload(code: String, payload: com.google.gson.JsonObject?): String {
+        val raw = payload?.get("customer_type")?.asString
+        if (!raw.isNullOrBlank()) {
+            return raw.trim().uppercase(Locale.US)
+        }
+        return if (code.startsWith("MJ", ignoreCase = true)) {
+            CustomerType.BUYER
+        } else {
+            CustomerType.SELLER
+        }
+    }
+
+    private fun resolveEnabledFromPayload(payload: com.google.gson.JsonObject?, default: Boolean = true): Boolean {
+        if (payload == null) return default
+        if (payload.has("enabled") && !payload.get("enabled").isJsonNull) {
+            return payload.get("enabled").asBoolean
+        }
+        if (payload.has("status") && !payload.get("status").isJsonNull) {
+            return payload.get("status").asInt != 0
+        }
+        return default
+    }
+
     private suspend fun applyLocationDelta(opType: String, payload: com.google.gson.JsonObject) {
-        val code = payload.get("code")?.asString ?: return
+        val name = payload.get("name")?.asString
+            ?: payload.get("code")?.asString
+            ?: return
         if (opType == "DELETE") {
-            database.locationDao().getByLocationNo(code)?.let { database.locationDao().delete(it) }
+            database.locationDao().getByLocationName(name)?.let { existing ->
+                database.locationDao().updateEnabledStatus(existing.id, false)
+            }
             return
         }
-        val name = payload.get("name")?.asString ?: code
-        val enabled = payload.get("enabled")?.asBoolean ?: true
-        val existing = database.locationDao().getByLocationNo(code)
+        val enabled = resolveEnabledFromPayload(payload)
+        val description = payload.get("description")?.asString ?: ""
+        val existing = database.locationDao().getByLocationName(name)
         if (existing == null) {
             database.locationDao().insert(
                 Location(
-                    locationNo = code,
                     locationName = name,
+                    description = description,
                     enabled = enabled,
                     syncStatus = 1,
-                )
+                ),
             )
         } else {
             database.locationDao().update(
                 existing.copy(
                     locationName = name,
+                    description = description,
                     enabled = enabled,
                     syncStatus = 1,
-                )
+                ),
             )
         }
     }
 
     private suspend fun applyOperatorDelta(opType: String, payload: com.google.gson.JsonObject) {
-        val code = payload.get("code")?.asString ?: return
+        val name = payload.get("name")?.asString
+            ?: payload.get("code")?.asString
+            ?: return
         if (opType == "DELETE") {
-            database.operatorDao().getByOperatorNo(code)?.let { database.operatorDao().delete(it) }
+            database.operatorDao().getByOperatorName(name)?.let { existing ->
+                database.operatorDao().updateEnabledStatus(existing.id, false)
+            }
             return
         }
-        val name = payload.get("name")?.asString ?: code
-        val enabled = payload.get("enabled")?.asBoolean ?: true
-        val existing = database.operatorDao().getByOperatorNo(code)
+        val enabled = resolveEnabledFromPayload(payload)
+        val existing = database.operatorDao().getByOperatorName(name)
         if (existing == null) {
             database.operatorDao().insert(
                 Operator(
-                    operatorNo = code,
                     name = name,
                     enabled = enabled,
                     syncStatus = 1,
-                )
+                ),
             )
         } else {
             database.operatorDao().update(
@@ -2119,9 +3309,120 @@ class TcpSyncManager(
                     name = name,
                     enabled = enabled,
                     syncStatus = 1,
+                ),
+            )
+        }
+    }
+
+    private suspend fun applyProductDelta(opType: String, payload: com.google.gson.JsonObject) {
+        val code = payload.get("code")?.asString?.trim().orEmpty()
+        val name = payload.get("name")?.asString?.trim().orEmpty()
+        val lookupKey = code.ifBlank { name }
+        if (lookupKey.isBlank()) return
+        if (opType == "DELETE") {
+            findProductForDelta(code, name, payload.get("previous_name")?.asString)?.let { existing ->
+                database.productDao().setEnabled(existing.id, false)
+            }
+            return
+        }
+        val enabled = resolveEnabledFromPayload(payload)
+        val category = payload.get("category")?.asString ?: "梨"
+        val previousName = payload.get("previous_name")?.asString?.trim().orEmpty()
+        val existing = findProductForDelta(code, name, previousName)
+        if (existing == null) {
+            database.productDao().insert(
+                Product(
+                    productNo = code.ifBlank { name },
+                    productName = name.ifBlank { code },
+                    enabled = enabled,
+                    category = category,
+                    syncStatus = 1,
+                )
+            )
+        } else {
+            database.productDao().update(
+                existing.copy(
+                    productNo = code.ifBlank { existing.productNo },
+                    productName = name.ifBlank { existing.productName },
+                    enabled = enabled,
+                    category = category,
+                    syncStatus = 1,
                 )
             )
         }
+    }
+
+    private suspend fun findProductForDelta(
+        code: String,
+        name: String,
+        previousName: String?,
+    ): Product? {
+        if (code.isNotBlank()) {
+            database.productDao().getByProductNo(code)?.let { return it }
+        }
+        if (!previousName.isNullOrBlank()) {
+            database.productDao().getByProductName(previousName)?.let { return it }
+            if (previousName != code) {
+                database.productDao().getByProductNo(previousName)?.let { return it }
+            }
+        }
+        if (name.isNotBlank()) {
+            database.productDao().getByProductName(name)?.let { return it }
+        }
+        if (code.isNotBlank() && code != name) {
+            database.productDao().getByProductName(code)?.let { return it }
+        }
+        return null
+    }
+
+    private suspend fun applyPackTypeDelta(opType: String, payload: com.google.gson.JsonObject) {
+        val name = payload.get("name")?.asString?.trim().orEmpty()
+        val codeKey = payload.get("code")?.asString?.trim().orEmpty()
+        val lookupName = name.ifBlank { codeKey }
+        if (lookupName.isBlank()) return
+        val previousName = payload.get("previous_name")?.asString?.trim().orEmpty()
+        if (opType == "DELETE") {
+            findPackTypeForDelta(lookupName, previousName.ifBlank { lookupName })?.let { existing ->
+                database.packagingTypeDao().setEnabled(existing.id, false)
+            }
+            return
+        }
+        val enabled = resolveEnabledFromPayload(payload)
+        val unit = payload.get("unit")?.asString ?: "个"
+        val unitPrice = payload.get("unit_price")?.asDouble ?: 0.0
+        val remark = payload.get("remark")?.asString ?: ""
+        val existing = findPackTypeForDelta(lookupName, previousName)
+        if (existing == null) {
+            database.packagingTypeDao().insert(
+                com.pingwei.lengkubao.data.db.entity.PackagingType(
+                    typeName = lookupName,
+                    unit = unit,
+                    unitPrice = unitPrice,
+                    enabled = enabled,
+                    remark = remark,
+                ),
+            )
+        } else {
+            database.packagingTypeDao().update(
+                existing.copy(
+                    typeName = lookupName,
+                    unit = unit,
+                    unitPrice = unitPrice,
+                    enabled = enabled,
+                    remark = remark,
+                ),
+            )
+        }
+    }
+
+    private suspend fun findPackTypeForDelta(name: String, previousName: String?): PackagingType? {
+        if (!previousName.isNullOrBlank()) {
+            database.packagingTypeDao().getByTypeName(previousName)?.let { return it }
+        }
+        if (name.isNotBlank()) {
+            database.packagingTypeDao().getByTypeName(name)?.let { return it }
+        }
+        return null
     }
 
     suspend fun autoSyncConfigsOnStartup() {
@@ -2254,6 +3555,8 @@ class TcpSyncManager(
                         "client_code" to deduction.customerNo,
                         "client_name" to deduction.customerName,
                         "amount" to deduction.amount.toString(),
+                        "quantity" to deduction.quantity.toString(),
+                        "unit_price" to deduction.unitPrice.toString(),
                         "deduct_date" to deduction.deductDate,
                         "reason" to (deduction.reason ?: ""),
                         "handler" to (deduction.handler ?: ""),
@@ -2321,6 +3624,7 @@ class TcpSyncManager(
 
                 _syncState.value = SyncState.Syncing("全量反向同步")
                 Log.i(TAG, "🔄 开始全量反向同步（以电脑端为主）")
+                lastFullSyncBaselineSeq = null
                 // 全量同步数据可能很大（分块数多），60s 很容易误判超时导致重连/连接切换。
                 // 这里提高 socket 超时，并配合下方等待超时一起放宽。
                 socket?.soTimeout = maxOf(syncConfig.receiveTimeout, 300000)
@@ -2343,15 +3647,17 @@ class TcpSyncManager(
                 val syncDeferred = CompletableDeferred<Boolean>()
 
                 // ✅ 设置全量同步消息监听器（挂起函数类型）
-                var receivedChunks = 0
+                val chunkMap = linkedMapOf<Int, String>()
                 var totalChunks = 0
-                val stringBuilder = StringBuilder()
+                var assembledJsonData = ""
 
                 fullSyncListener = { message ->
                     Log.d(TAG, "📥 全量同步处理器收到消息: ${message.take(100)}")
 
                     when {
                         message.startsWith("FULL_SYNC_START|") -> {
+                            chunkMap.clear()
+                            assembledJsonData = ""
                             val parts = message.split("|")
                             if (parts.size >= 3) {
                                 totalChunks = parts[1].toIntOrNull() ?: 0
@@ -2361,21 +3667,24 @@ class TcpSyncManager(
                         }
 
                         message.startsWith("FULL_SYNC_DATA|") -> {
-                            // ✅ 修复：直接按 | 分割，格式: FULL_SYNC_DATA|块索引|总块数|JSON数据
                             val parts = message.split("|", limit = 4)
                             if (parts.size >= 4) {
                                 val chunkIndex = parts[1].toIntOrNull() ?: 0
                                 totalChunks = parts[2].toIntOrNull() ?: totalChunks
                                 val chunkData = parts[3]
 
-                                stringBuilder.append(chunkData)
-                                receivedChunks++
+                                if (chunkIndex in 1..totalChunks) {
+                                    chunkMap[chunkIndex] = chunkData
+                                }
 
-                                Log.d(TAG, "📦 接收数据块: $chunkIndex/$totalChunks, receivedChunks=$receivedChunks, 数据长度=${chunkData.length}")
+                                Log.d(
+                                    TAG,
+                                    "📦 接收数据块: $chunkIndex/$totalChunks, 已收 ${chunkMap.size} 块, 数据长度=${chunkData.length}",
+                                )
 
-                                if (receivedChunks % 10 == 0 || receivedChunks == totalChunks) {
-                                    Log.d(TAG, "📦 接收进度: $receivedChunks/$totalChunks")
-                                    onProgress?.invoke(2, 3, "接收数据 $receivedChunks/$totalChunks")
+                                if (chunkMap.size % 10 == 0 || chunkMap.size == totalChunks) {
+                                    Log.d(TAG, "📦 接收进度: ${chunkMap.size}/$totalChunks")
+                                    onProgress?.invoke(2, 3, "接收数据 ${chunkMap.size}/$totalChunks")
                                 }
                             } else {
                                 Log.w(TAG, "⚠️ FULL_SYNC_DATA 解析失败，原始消息: ${message.take(200)}")
@@ -2383,8 +3692,32 @@ class TcpSyncManager(
                         }
 
                         message.startsWith("FULL_SYNC_END|") -> {
-                            Log.i(TAG, "✅ 全量数据接收完成，共 $receivedChunks 块，累计数据长度: ${stringBuilder.length}")
-                            syncDeferred.complete(true)
+                            parseCommitSeqFromFullSyncEnd(message)?.let { seq ->
+                                if (seq > 0L) {
+                                    lastFullSyncBaselineSeq = seq
+                                    Log.i(TAG, "📌 全量基线 commit_seq=$seq")
+                                }
+                            }
+                            when {
+                                totalChunks <= 0 || chunkMap.size < totalChunks -> {
+                                    Log.e(TAG, "❌ 全量数据块不完整: ${chunkMap.size}/$totalChunks")
+                                    syncDeferred.complete(false)
+                                }
+                                else -> {
+                                    val missingIndex = (1..totalChunks).firstOrNull { !chunkMap.containsKey(it) }
+                                    if (missingIndex != null) {
+                                        Log.e(TAG, "❌ 全量数据缺少块: $missingIndex/$totalChunks")
+                                        syncDeferred.complete(false)
+                                    } else {
+                                        assembledJsonData = (1..totalChunks).joinToString("") { chunkMap[it]!! }
+                                        Log.i(
+                                            TAG,
+                                            "✅ 全量数据接收完成，共 ${chunkMap.size} 块，累计数据长度: ${assembledJsonData.length}",
+                                        )
+                                        syncDeferred.complete(true)
+                                    }
+                                }
+                            }
                         }
 
                         message.startsWith("FULL_SYNC_ERROR|") -> {
@@ -2410,7 +3743,7 @@ class TcpSyncManager(
                         syncDeferred.await()
                     }
                 } catch (e: TimeoutCancellationException) {
-                    Log.e(TAG, "❌ 等待全量同步数据超时，已接收 $receivedChunks 块")
+                    Log.e(TAG, "❌ 等待全量同步数据超时，已接收 ${chunkMap.size}/$totalChunks 块")
                     false
                 } finally {
                     // ✅ 清除监听器
@@ -2424,8 +3757,8 @@ class TcpSyncManager(
                     return@withContext false
                 }
 
-                if (receivedChunks < totalChunks) {
-                    val errorMsg = "数据接收不完整：$receivedChunks/$totalChunks"
+                if (chunkMap.size < totalChunks || totalChunks <= 0) {
+                    val errorMsg = "数据接收不完整：${chunkMap.size}/$totalChunks"
                     Log.e(TAG, "❌ $errorMsg")
                     onResult?.invoke(false, errorMsg)
                     _syncState.value = SyncState.Failed(errorMsg)
@@ -2433,9 +3766,9 @@ class TcpSyncManager(
                 }
 
                 onProgress?.invoke(3, 3, "更新本地数据")
-                Log.i(TAG, "🔄 开始解析并替换本地数据，数据长度: ${stringBuilder.length}")
+                Log.i(TAG, "🔄 开始解析并替换本地数据，数据长度: ${assembledJsonData.length}")
 
-                val jsonData = stringBuilder.toString()
+                val jsonData = assembledJsonData
                 if (jsonData.isEmpty()) {
                     val errorMsg = "接收到的数据为空"
                     Log.e(TAG, "❌ $errorMsg")
@@ -2459,9 +3792,8 @@ class TcpSyncManager(
                                     if (existing == null) {
                                         val location = com.pingwei.lengkubao.data.db.entity.Location(
                                             locationName = locationData.name,
-                                            locationNo = "",
                                             enabled = true,
-                                            syncStatus = 1
+                                            syncStatus = 1,
                                         )
                                         database.locationDao().insert(location)
                                         Log.i(TAG, "✅ 新增库位: ${locationData.name}")
@@ -2480,9 +3812,8 @@ class TcpSyncManager(
                                     if (existing == null) {
                                         val operator = com.pingwei.lengkubao.data.db.entity.Operator(
                                             name = handlerData.name,
-                                            operatorNo = "",
                                             enabled = true,
-                                            syncStatus = 1
+                                            syncStatus = 1,
                                         )
                                         database.operatorDao().insert(operator)
                                         Log.i(TAG, "✅ 新增经手人: ${handlerData.name}")
@@ -2494,26 +3825,33 @@ class TcpSyncManager(
                                 Log.i(TAG, "✅ 经手人数据同步完成: ${fullData.data.handlers.size} 条")
                             }
 
-                            // 同步客户数据
-                            if (fullData.data.clients != null) {
-                                for (clientData in fullData.data.clients) {
-                                    val existing = database.customerDao().getByCustomerNo(clientData.code)
-                                    if (existing != null) {
-                                        database.customerDao().updateCustomer(
-                                            existing.id,
-                                            clientData.name,
-                                            clientData.phone ?: ""
-                                        )
-                                    } else {
-                                        val customer = com.pingwei.lengkubao.data.db.entity.Customer(
-                                            customerNo = clientData.code,
-                                            customerName = clientData.name,
-                                            phone = clientData.phone ?: ""
-                                        )
-                                        database.customerDao().insertCustomer(customer)
-                                    }
+                            // 同步客户数据（卖家 + 买家，真替换）
+                            replaceCustomersFromSnapshot(fullData.data.clients)
+
+                            fullData.data.product_types?.let { products ->
+                                val arr = com.google.gson.JsonArray()
+                                products.forEach { p ->
+                                    val obj = com.google.gson.JsonObject()
+                                    obj.addProperty("code", p.code)
+                                    obj.addProperty("name", p.name)
+                                    p.enabled?.let { obj.addProperty("enabled", it) }
+                                    p.category?.let { obj.addProperty("category", it) }
+                                    arr.add(obj)
                                 }
-                                Log.i(TAG, "✅ 客户数据同步完成: ${fullData.data.clients.size} 条")
+                                replaceProductsFromSnapshot(arr)
+                            }
+
+                            fullData.data.pack_types?.let { packs ->
+                                val arr = com.google.gson.JsonArray()
+                                packs.forEach { p ->
+                                    val obj = com.google.gson.JsonObject()
+                                    obj.addProperty("name", p.name)
+                                    p.enabled?.let { obj.addProperty("enabled", it) }
+                                    p.unit?.let { obj.addProperty("unit", it) }
+                                    p.unit_price?.let { obj.addProperty("unit_price", it) }
+                                    arr.add(obj)
+                                }
+                                replacePackTypesFromSnapshot(arr)
                             }
 
                             // ✅ 同步PC库存快照（库位 + 型号），并刷新 stock.current_quantity（保留 reserved_quantity）
@@ -2564,7 +3902,6 @@ class TcpSyncManager(
                                                 productNo = product.productNo,
                                                 productName = product.productName,
                                                 locationId = location.id,
-                                                locationNo = location.locationNo,
                                                 currentQuantity = stockData.current_quantity,
                                                 reservedQuantity = 0,
                                                 lastUpdated = now,
@@ -2624,6 +3961,8 @@ class TcpSyncManager(
 
                                 if (snapshots.isNotEmpty()) {
                                     database.pcInboundDailySnapshotDao().upsertAll(snapshots)
+                                    com.pingwei.lengkubao.service.CustomerInboundStockBackfill(database)
+                                        .refreshFromPcSnapshots()
                                 }
 
                                 Log.i(
@@ -2704,7 +4043,7 @@ class TcpSyncManager(
                     if (bill.packagingTypeFlag == "RETURN") {
                         packagingWithFlag++
                     }
-                    if (!syncPackagingBill(bill.id)) inventoryRelatedSyncFailed = true
+                    if (!syncPackagingBill(bill.id).success) inventoryRelatedSyncFailed = true
                     totalSync++
                     delay(500)
                 }
@@ -2725,10 +4064,46 @@ class TcpSyncManager(
                     delay(500)
                 }
 
-                val flagInfo = if (packagingWithFlag > 0) "，其中退包装单 $packagingWithFlag 张" else ""
+                val pendingPresaleOutbounds = database.outboundRecordDao().getUnsyncedRecords()
+                val presaleOutboundCount = pendingPresaleOutbounds.size
+                for (record in pendingPresaleOutbounds) {
+                    syncPreSaleOutbound(record.id)
+                    totalSync++
+                    delay(500)
+                }
+
+                val pendingPresales = database.preSaleBillDao().getUnsyncedBills()
+                val presaleCount = pendingPresales.size
+                for (bill in pendingPresales) {
+                    syncPreSaleBill(bill.id)
+                    totalSync++
+                    delay(500)
+                }
+
+                val pendingPresalePayments = database.paymentRecordDao().getUnsyncedPayments()
+                val presalePaymentCount = pendingPresalePayments.size
+                for (payment in pendingPresalePayments) {
+                    syncPreSalePayment(payment.id)
+                    totalSync++
+                    delay(500)
+                }
+
+                val pendingLedgerEntries = database.ledgerEntryDao().getUnsyncedEntries()
+                val ledgerCount = pendingLedgerEntries.size
+                for (entry in pendingLedgerEntries) {
+                    syncLedgerEntry(entry.id)
+                    totalSync++
+                    delay(500)
+                }
+
+                val flagInfo = if (packagingWithFlag > 0) "，其中进包装单 $packagingWithFlag 张" else ""
                 val advanceInfo = if (advanceCount > 0) "，预支款 $advanceCount 条" else ""
                 val deductionInfo = if (deductionCount > 0) "，扣款 $deductionCount 条" else ""
-                val successMsg = "批量同步数据发送完成：共发送 $totalSync 条数据$flagInfo$advanceInfo$deductionInfo，等待服务器逐个确认"
+                val presaleInfo = if (presaleCount > 0) "，预售单 $presaleCount 张" else ""
+                val presalePaymentInfo = if (presalePaymentCount > 0) "，预售收款 $presalePaymentCount 条" else ""
+                val presaleOutboundInfo = if (presaleOutboundCount > 0) "，预售出库 $presaleOutboundCount 条" else ""
+                val ledgerInfo = if (ledgerCount > 0) "，收支流水 $ledgerCount 条" else ""
+                val successMsg = "批量同步数据发送完成：共发送 $totalSync 条数据$flagInfo$advanceInfo$deductionInfo$presaleInfo$presalePaymentInfo$presaleOutboundInfo$ledgerInfo，等待服务器逐个确认"
                 _syncState.value = SyncState.Success(successMsg)
                 _messageChannel.send(successMsg)
                 Log.i(TAG, "✅ $successMsg")
@@ -2831,6 +4206,249 @@ class TcpSyncManager(
     fun isConnected(): Boolean = isConnected.get()
 
     fun getCurrentConfig(): SyncConfig = syncConfig
+
+    /** 扫码配对：写入 IP/端口/配对码并可选立即连接。 */
+    fun applyQrPairing(payload: QrPairingHelper.PairingPayload, connectNow: Boolean = true) {
+        val ip = payload.ip.trim()
+        require(isValidServerIp(ip)) { "二维码中的 IP 无效: $ip" }
+        require(payload.code.isNotBlank()) { "二维码缺少配对码" }
+
+        val prefs = context.getSharedPreferences("sync_config", Context.MODE_PRIVATE)
+        prefs.edit().apply {
+            putString(Constant.PREF_PAIRING_CODE, payload.code)
+            putString(Constant.PREF_PAIRED_SERVER_IP, ip)
+            putInt(Constant.PREF_PAIRED_SERVER_PORT, payload.port)
+            putString("server_ip", ip)
+            putInt("server_port", payload.port)
+        }.apply()
+
+        updateConfig(
+            syncConfig.copy(
+                serverIp = ip,
+                serverPort = payload.port
+            )
+        )
+        notifyDiscoveryApplied()
+        Log.i(TAG, "📱 二维码配对成功: ${payload.name} $ip:${payload.port}")
+        if (connectNow) {
+            connect()
+        }
+    }
+
+    private fun parseKeyValueLong(data: String, key: String): Long? {
+        return data.split('|')
+            .mapNotNull { part ->
+                val trimmed = part.trim()
+                if (trimmed.startsWith("$key=", ignoreCase = true)) {
+                    trimmed.substringAfter("=").trim().toLongOrNull()
+                } else {
+                    null
+                }
+            }
+            .firstOrNull()
+    }
+
+    private fun parseCommitSeqFromSyncReady(data: String): Long? = parseKeyValueLong(data, "seq")
+
+    private fun parseCommitSeqFromFullSyncEnd(message: String): Long? = parseKeyValueLong(message, "commit_seq")
+
+    private fun resolveFullSyncBaselineSeq(): Long {
+        return lastFullSyncBaselineSeq ?: lastKnownServerCommitSeq ?: 0L
+    }
+
+    private suspend fun purgeCustomersExceptSnapshot(syncedCodes: List<String>) {
+        if (syncedCodes.isEmpty()) {
+            database.customerDao().deleteAllCustomers()
+            Log.i(TAG, "🧹 已清空本地客户（PC 快照为空）")
+        } else {
+            database.customerDao().deleteExceptCodes(syncedCodes)
+            Log.i(TAG, "🧹 已清理快照外客户，保留 ${syncedCodes.size} 条")
+        }
+    }
+
+    private suspend fun replaceProductsFromSnapshot(productsArray: com.google.gson.JsonArray) {
+        val syncedCodes = mutableListOf<String>()
+        for (i in 0 until productsArray.size()) {
+            val obj = productsArray.get(i).asJsonObject
+            val code = obj.get("code")?.asString ?: continue
+            val name = obj.get("name")?.asString ?: code
+            val enabled = resolveEnabledFromPayload(obj)
+            val category = obj.get("category")?.asString ?: "梨"
+            val existing = database.productDao().getByProductNo(code)
+                ?: database.productDao().getByProductName(name)
+            if (existing == null) {
+                database.productDao().insert(
+                    Product(
+                        productNo = code,
+                        productName = name,
+                        enabled = enabled,
+                        category = category,
+                        syncStatus = 1,
+                    ),
+                )
+            } else {
+                database.productDao().update(
+                    existing.copy(
+                        productNo = code,
+                        productName = name,
+                        enabled = enabled,
+                        category = category,
+                        syncStatus = 1,
+                    ),
+                )
+            }
+            syncedCodes.add(code)
+        }
+        if (syncedCodes.isEmpty()) {
+            database.productDao().deleteAllProducts()
+        } else {
+            database.productDao().deleteExceptProductNos(syncedCodes)
+        }
+        Log.i(TAG, "✅ 型号数据同步完成: ${syncedCodes.size} 条（已清理快照外型号）")
+    }
+
+    private suspend fun replacePackTypesFromSnapshot(packTypesArray: com.google.gson.JsonArray) {
+        val syncedNames = mutableListOf<String>()
+        for (i in 0 until packTypesArray.size()) {
+            val obj = packTypesArray.get(i).asJsonObject
+            val name = obj.get("name")?.asString ?: continue
+            val enabled = resolveEnabledFromPayload(obj)
+            val unit = obj.get("unit")?.asString ?: "个"
+            val unitPrice = obj.get("unit_price")?.asDouble ?: 0.0
+            val existing = database.packagingTypeDao().getByTypeName(name)
+            if (existing == null) {
+                database.packagingTypeDao().insert(
+                    com.pingwei.lengkubao.data.db.entity.PackagingType(
+                        typeName = name,
+                        unit = unit,
+                        unitPrice = unitPrice,
+                        enabled = enabled,
+                    ),
+                )
+            } else {
+                database.packagingTypeDao().update(
+                    existing.copy(
+                        typeName = name,
+                        unit = unit,
+                        unitPrice = unitPrice,
+                        enabled = enabled,
+                    ),
+                )
+            }
+            syncedNames.add(name)
+        }
+        if (syncedNames.isEmpty()) {
+            database.packagingTypeDao().deleteAllPackagingTypes()
+        } else {
+            database.packagingTypeDao().deleteExceptTypeNames(syncedNames)
+        }
+        Log.i(TAG, "✅ 包装类型同步完成: ${syncedNames.size} 条（已清理快照外包装）")
+    }
+
+    private suspend fun replaceCustomersFromSnapshot(clients: List<ClientSyncData>?) {
+        if (clients == null) return
+        val syncedCodes = mutableListOf<String>()
+        for (clientData in clients) {
+            if (clientData.code.isBlank()) continue
+            val enabled = clientData.enabled ?: true
+            val payload = com.google.gson.JsonObject().apply {
+                clientData.customer_type?.let { addProperty("customer_type", it) }
+            }
+            val customerType = resolveCustomerTypeFromPayload(clientData.code, payload)
+            upsertCustomerFromRemote(
+                code = clientData.code,
+                name = clientData.name,
+                phone = clientData.phone ?: "",
+                customerType = customerType,
+                enabled = enabled,
+            )
+            syncedCodes.add(clientData.code)
+        }
+        purgeCustomersExceptSnapshot(syncedCodes)
+        Log.i(TAG, "✅ 客户数据同步完成: ${syncedCodes.size} 条（含卖家/买家，已清理快照外客户）")
+    }
+
+    private fun parseActiveYearFromSyncReady(data: String): Int? {
+        return data.split('|')
+            .mapNotNull { part ->
+                val trimmed = part.trim()
+                if (trimmed.startsWith("active_year=", ignoreCase = true)) {
+                    trimmed.substringAfter("=").trim().toIntOrNull()
+                } else {
+                    null
+                }
+            }
+            .firstOrNull()
+    }
+
+    private suspend fun ensureSyncYearAligned(): Boolean {
+        if (!isConnected.get() || !isRegistered.get()) {
+            return false
+        }
+        val deviceId = getDeviceId()
+        val cursor = syncDao.getCursor(deviceId) ?: SyncDeviceCursor(
+            deviceId = deviceId,
+            updatedAt = System.currentTimeMillis(),
+        )
+        syncDao.upsertCursor(cursor)
+        val helloPayload = gson.toJson(
+            mapOf(
+                "device_id" to deviceId,
+                "first_full_sync_done" to cursor.firstFullSyncDone,
+                "last_acked_seq" to cursor.lastAckedSeq,
+                "supports_delta" to true,
+                "mode" to "LWW_COMMIT_SEQ",
+            )
+        )
+        val syncReadyData = sendMessageAndWaitForCommand(
+            "HELLO_SYNC|$helloPayload",
+            "SYNC_SERVER_READY",
+            15000L,
+        )
+        if (syncReadyData == null) {
+            val err = "等待服务器就绪超时"
+            _syncState.value = SyncState.Failed(err)
+            _messageChannel.send(err)
+            return false
+        }
+        parseActiveYearFromSyncReady(syncReadyData)?.let { lastKnownPcActiveYear = it }
+        parseCommitSeqFromSyncReady(syncReadyData)?.let { seq ->
+            if (seq > 0L) {
+                lastKnownServerCommitSeq = seq
+                Log.d(TAG, "📌 PC commit_seq=$seq")
+            }
+        }
+        checkSyncYearMismatch(syncReadyData)?.let { mismatchMsg ->
+            Log.e(TAG, "❌ $mismatchMsg")
+            sendConnectionBroadcast(false, mismatchMsg)
+            disconnect()
+            _syncState.value = SyncState.Failed(mismatchMsg)
+            _messageChannel.send(mismatchMsg)
+            return false
+        }
+        return true
+    }
+
+    private fun canSyncPresaleData(): Boolean {
+        if (!FiscalYearManager.isInitialized) return true
+        val pcYear = lastKnownPcActiveYear ?: return true
+        val localYear = FiscalYearManager.activeYear
+        if (pcYear != localYear) {
+            Log.w(TAG, "预售同步跳过：PC年份=$pcYear，本地=$localYear")
+            return false
+        }
+        return true
+    }
+
+    private fun checkSyncYearMismatch(syncReadyData: String): String? {
+        val pcYear = parseActiveYearFromSyncReady(syncReadyData) ?: return null
+        if (!FiscalYearManager.isInitialized) return null
+        val localYear = FiscalYearManager.activeYear
+        if (pcYear != localYear) {
+            return "PC 活跃年份为 $pcYear，手持端为 $localYear，请先统一年份"
+        }
+        return null
+    }
 }
 
 // 全量同步数据类
@@ -2846,14 +4464,34 @@ data class FullSyncDataContent(
     val clients: List<ClientSyncData>?,
     val locations: List<LocationSyncData>?,
     val handlers: List<HandlerSyncData>?,
+    val product_types: List<ProductSyncData>? = null,
+    val pack_types: List<PackTypeSyncData>? = null,
     val stocks: List<StockSyncData>?,
-    val inbound_stats: InboundStatsSyncData?
+    val inbound_stats: InboundStatsSyncData?,
+    val presale_bills: List<com.google.gson.JsonObject>? = null,
+    val presale_payments: List<com.google.gson.JsonObject>? = null,
+)
+
+data class ProductSyncData(
+    val code: String,
+    val name: String,
+    val enabled: Boolean? = null,
+    val category: String? = null,
+)
+
+data class PackTypeSyncData(
+    val name: String,
+    val enabled: Boolean? = null,
+    val unit: String? = null,
+    val unit_price: Double? = null,
 )
 
 data class ClientSyncData(
     val code: String,
     val name: String,
-    val phone: String?
+    val phone: String? = null,
+    val customer_type: String? = null,
+    val enabled: Boolean? = null,
 )
 
 data class LocationSyncData(

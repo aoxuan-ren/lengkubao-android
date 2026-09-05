@@ -15,6 +15,7 @@ import androidx.compose.ui.unit.dp
 import com.pingwei.lengkubao.data.db.entity.PackagingType
 import com.pingwei.lengkubao.ui.packaging.viewmodel.PackagingInputItem
 import com.pingwei.lengkubao.ui.theme.AppDimens
+import com.pingwei.lengkubao.ui.common.rememberDismissKeyboard
 
 @Composable
 fun PackagingTypeSelectorDialog(
@@ -34,13 +35,13 @@ fun PackagingTypeSelectorDialog(
     }
 
     var searchText by remember { mutableStateOf("") }
+    val dismissKeyboard = rememberDismissKeyboard()
     val filteredTypes = remember(searchText, availablePackagingTypes) {
         if (searchText.isBlank()) {
             availablePackagingTypes
         } else {
             availablePackagingTypes.filter { type ->
-                type.typeName.contains(searchText, ignoreCase = true) ||
-                        type.typeNo.contains(searchText, ignoreCase = true)
+                type.typeName.contains(searchText, ignoreCase = true)
             }
         }
     }
@@ -133,6 +134,7 @@ fun PackagingTypeSelectorDialog(
                             PackagingTypeItem(
                                 packagingType = packagingType,
                                 onClick = {
+                                    dismissKeyboard()
                                     onPackagingTypeSelected(packagingType)
                                     onDismiss()
                                 }
@@ -162,7 +164,6 @@ fun PackagingTypeItem(
         },
         supportingContent = {
             Column {
-                Text("编号: ${packagingType.typeNo}")
                 Text("单价: ¥${String.format("%.2f", packagingType.unitPrice)}/${packagingType.unit}")
                 if (packagingType.remark.isNotEmpty()) {
                     Text(

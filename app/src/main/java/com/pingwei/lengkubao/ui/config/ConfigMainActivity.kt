@@ -6,8 +6,9 @@ import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.ScrollState
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
@@ -18,19 +19,32 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.platform.LocalLifecycleOwner
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.navigation.NavHostController
+import androidx.navigation.NavType
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
+import androidx.navigation.navArgument
+import com.pingwei.lengkubao.LengKuBaoApplication
 import com.pingwei.lengkubao.data.db.AppDatabase
-import com.pingwei.lengkubao.sync.TcpSyncManager
+import com.pingwei.lengkubao.fiscal.FiscalYearManager
+import com.pingwei.lengkubao.fiscal.YearSwitchCoordinator
 import com.pingwei.lengkubao.utils.AppCacheCleaner
+import com.pingwei.lengkubao.utils.ConfigSyncStatusNotifier
 import com.pingwei.lengkubao.ui.theme.LengkubaoTheme
 import com.pingwei.lengkubao.ui.customer.BuyerListActivity
+import com.pingwei.lengkubao.ui.customer.CustomerListActivity
 
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.ui.text.input.KeyboardType
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.util.Calendar
 
 class ConfigMainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -50,6 +64,7 @@ fun ConfigMainScreen() {
     val context = LocalContext.current
     val snackbarHostState = remember { SnackbarHostState() }
     val coroutineScope = rememberCoroutineScope()
+    val mainScrollState = rememberSaveable(saver = ScrollState.Saver) { ScrollState(0) }
 
     Scaffold(
         topBar = {
@@ -92,11 +107,15 @@ fun ConfigMainScreen() {
                 composable("main") {
                     // 使用可滚动的内容区域
                     ScrollableConfigMainContent(
-                        onProductConfigClick = { navController.navigate("product_config") },
-                        onLocationConfigClick = { navController.navigate("location_config") },
-                        onOperatorConfigClick = { navController.navigate("operator_config") },
-                        onPackagingConfigClick = { navController.navigate("packaging_config") },
-                        onPrintConfigClick = {
+                        scrollState = mainScrollState,
+                        onCustomerManagementClick = {
+                            context.startActivity(Intent(context, CustomerListActivity::class.java))
+                        },
+                        onProductConfigClick = { navController.navigateConfigSub("product_config") },
+                        onLocationConfigClick = { navController.navigateConfigSub("location_config") },
+                        onOperatorConfigClick = { navController.navigateConfigSub("operator_config") },
+                        onPackagingConfigClick = { navController.navigateConfigSub("packaging_config") },
+                        onCompanyInfoClick = {
                             context.startActivity(Intent(context, PrintConfigActivity::class.java))
                         },
                         onBuyerListClick = {
@@ -108,43 +127,113 @@ fun ConfigMainScreen() {
                 }
 
                 composable("product_config") {
-                    ProductConfigScreen()
+                    ProductConfigScreen(
+                        navController = navController,
+                        snackbarHostState = snackbarHostState,
+                    )
+                }
+
+                composable("product_add") {
+                    ProductFormScreen(productId = null, onSaved = { navController.navigateUp() })
+                }
+
+                composable(
+                    route = "product_edit/{id}",
+                    arguments = listOf(navArgument("id") { type = NavType.LongType })
+                ) { backStackEntry ->
+                    val id = backStackEntry.arguments?.getLong("id") ?: return@composable
+                    ProductFormScreen(productId = id, onSaved = { navController.navigateUp() })
                 }
 
                 composable("location_config") {
-                    LocationConfigScreen(onBack = { navController.navigateUp() })
+                    LocationConfigScreen(
+                        navController = navController,
+                        snackbarHostState = snackbarHostState,
+                    )
+                }
+
+                composable("location_add") {
+                    LocationFormScreen(locationId = null, onSaved = { navController.navigateUp() })
+                }
+
+                composable(
+                    route = "location_edit/{id}",
+                    arguments = listOf(navArgument("id") { type = NavType.LongType })
+                ) { backStackEntry ->
+                    val id = backStackEntry.arguments?.getLong("id") ?: return@composable
+                    LocationFormScreen(locationId = id, onSaved = { navController.navigateUp() })
                 }
 
                 composable("operator_config") {
-                    OperatorConfigScreen(onBack = { navController.navigateUp() })
+                    OperatorConfigScreen(
+                        navController = navController,
+                        snackbarHostState = snackbarHostState,
+                    )
+                }
+
+                composable("operator_add") {
+                    OperatorFormScreen(operatorId = null, onSaved = { navController.navigateUp() })
+                }
+
+                composable(
+                    route = "operator_edit/{id}",
+                    arguments = listOf(navArgument("id") { type = NavType.LongType })
+                ) { backStackEntry ->
+                    val id = backStackEntry.arguments?.getLong("id") ?: return@composable
+                    OperatorFormScreen(operatorId = id, onSaved = { navController.navigateUp() })
                 }
 
                 composable("packaging_config") {
-                    PackagingConfigScreen()
+                    PackagingConfigScreen(
+                        navController = navController,
+                        snackbarHostState = snackbarHostState,
+                    )
+                }
+
+                composable("packaging_add") {
+                    PackagingTypeFormScreen(packagingTypeId = null, onSaved = { navController.navigateUp() })
+                }
+
+                composable(
+                    route = "packaging_edit/{id}",
+                    arguments = listOf(navArgument("id") { type = NavType.LongType })
+                ) { backStackEntry ->
+                    val id = backStackEntry.arguments?.getLong("id") ?: return@composable
+                    PackagingTypeFormScreen(packagingTypeId = id, onSaved = { navController.navigateUp() })
                 }
             }
         }
     }
 }
 
+private fun NavHostController.navigateConfigSub(route: String) {
+    navigate(route) {
+        popUpTo("main") { saveState = true }
+        launchSingleTop = true
+        restoreState = true
+    }
+}
+
 @Composable
 fun ScrollableConfigMainContent(
+    scrollState: ScrollState,
+    onCustomerManagementClick: () -> Unit,
     onProductConfigClick: () -> Unit,
     onLocationConfigClick: () -> Unit,
     onOperatorConfigClick: () -> Unit,
     onPackagingConfigClick: () -> Unit,
-    onPrintConfigClick: () -> Unit,
+    onCompanyInfoClick: () -> Unit,
     onBuyerListClick: () -> Unit,
     snackbarHostState: SnackbarHostState,
     coroutineScope: CoroutineScope
 ) {
-    val appContext = LocalContext.current.applicationContext
-
-    // ========== 关键修复：在这里声明所有状态变量 ==========
-    val syncManager = remember { TcpSyncManager.getInstance(appContext, AppDatabase.getInstance(appContext)) }
+    val context = LocalContext.current
+    val appContext = context.applicationContext
 
     // 同步状态变量
     var isSyncing by remember { mutableStateOf(false) }
+    var isFullPulling by remember { mutableStateOf(false) }
+    var showFullPullDialog by remember { mutableStateOf(false) }
     var syncProgress by remember { mutableStateOf(0) }
     var syncTotal by remember { mutableStateOf(0) }
     var syncType by remember { mutableStateOf("") }
@@ -153,19 +242,47 @@ fun ScrollableConfigMainContent(
     var showClearCacheDialog by remember { mutableStateOf(false) }
     var cleanupPreview by remember { mutableStateOf<AppCacheCleaner.CleanupPreview?>(null) }
 
-    // 加载未同步数量
+    suspend fun refreshUnsyncedCounts() {
+        unsyncedCounts = LengKuBaoApplication.getSyncManager().checkUnsyncedConfigs()
+    }
+
+    // 加载未同步数量，并在配置变更/页面恢复时实时刷新
     LaunchedEffect(Unit) {
         try {
-            unsyncedCounts = syncManager.checkUnsyncedConfigs()
+            refreshUnsyncedCounts()
         } catch (e: Exception) {
             Log.e("Config", "检查未同步失败", e)
         }
+        ConfigSyncStatusNotifier.refreshRequests.collect {
+            try {
+                refreshUnsyncedCounts()
+            } catch (e: Exception) {
+                Log.e("Config", "刷新未同步数量失败", e)
+            }
+        }
+    }
+
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                coroutineScope.launch {
+                    try {
+                        refreshUnsyncedCounts()
+                    } catch (e: Exception) {
+                        Log.e("Config", "恢复时检查未同步失败", e)
+                    }
+                }
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .verticalScroll(rememberScrollState())
+            .verticalScroll(scrollState)
     ) {
         // 标题
         Text(
@@ -175,6 +292,18 @@ fun ScrollableConfigMainContent(
                 .fillMaxWidth()
                 .padding(horizontal = 16.dp, vertical = 24.dp)
         )
+
+        // 年份管理
+        FiscalYearManagementCard(
+            appContext = appContext,
+            snackbarHostState = snackbarHostState,
+            coroutineScope = coroutineScope,
+            onYearChanged = {
+                (context as? ComponentActivity)?.finish()
+            }
+        )
+
+        Spacer(modifier = Modifier.height(16.dp))
 
         // 同步功能区域
         Card(
@@ -201,27 +330,14 @@ fun ScrollableConfigMainContent(
                 // 显示未同步状态
                 unsyncedCounts?.let { counts ->
                     val total = counts["总计"] ?: 0
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceEvenly
-                    ) {
-                        // 只显示库位、经手人、客户，不显示商品
-                        listOf("库位", "经手人", "客户").forEach { type ->
-                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                                Text(
-                                    text = (counts[type] ?: 0).toString(),
-                                    style = MaterialTheme.typography.headlineSmall,
-                                    color = if ((counts[type] ?: 0) > 0)
-                                        MaterialTheme.colorScheme.error
-                                    else
-                                        MaterialTheme.colorScheme.onPrimaryContainer
-                                )
-                                Text(
-                                    text = type,
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.7f)
-                                )
-                            }
+                    val syncTypeLabels = listOf(
+                        listOf("库位", "经手人", "客户"),
+                        listOf("商品型号", "包装类型"),
+                    )
+                    syncTypeLabels.forEachIndexed { index, rowTypes ->
+                        ConfigSyncCountRow(counts = counts, types = rowTypes)
+                        if (index < syncTypeLabels.lastIndex) {
+                            Spacer(modifier = Modifier.height(6.dp))
                         }
                     }
 
@@ -238,7 +354,7 @@ fun ScrollableConfigMainContent(
                  }
 
                 // 进度条
-                if (isSyncing && syncTotal > 0) {
+                if ((isSyncing || isFullPulling) && syncTotal > 0) {
                     LinearProgressIndicator(
                         progress = syncProgress.toFloat() / syncTotal.toFloat(),
                         modifier = Modifier
@@ -277,7 +393,7 @@ fun ScrollableConfigMainContent(
                             coroutineScope.launch {
                                 try {
                                     syncResult = null
-                                    unsyncedCounts = syncManager.checkUnsyncedConfigs()
+                                    refreshUnsyncedCounts()
                                     val total = unsyncedCounts?.get("总计") ?: 0
                                     snackbarHostState.showSnackbar(
                                         if (total > 0) "发现 $total 条数据未同步"
@@ -289,7 +405,7 @@ fun ScrollableConfigMainContent(
                             }
                         },
                         modifier = Modifier.weight(1f),
-                        enabled = !isSyncing
+                        enabled = !isSyncing && !isFullPulling
                     ) {
                         Icon(
                             imageVector = Icons.Default.Refresh,
@@ -311,7 +427,7 @@ fun ScrollableConfigMainContent(
                                 syncType = ""
 
                                 // 检查连接
-                                if (!syncManager.isConnected()) {
+                                if (!LengKuBaoApplication.getSyncManager().isConnected()) {
                                     syncResult = Pair(false, "未连接服务器，请先连接")
                                     isSyncing = false
                                     snackbarHostState.showSnackbar("未连接服务器，请先连接")
@@ -319,46 +435,27 @@ fun ScrollableConfigMainContent(
                                 }
 
                                 // 显示开始同步提示
-                                snackbarHostState.showSnackbar("开始同步基础配置...")
+                                snackbarHostState.showSnackbar("开始双向增量同步...")
 
-                                // 执行同步（内部已包含正向同步和自动反向同步）
-                                syncManager.syncAllConfigs(
-                                    onProgress = { current, total, type ->
-                                        syncProgress = current
-                                        syncTotal = total
-                                        syncType = type
-                                        Log.d("Config", "同步进度: $type $current/$total")
-                                    },
+                                LengKuBaoApplication.getSyncManager().bidirectionalConfigSync(
                                     onResult = { success, message ->
                                         syncResult = Pair(success, message)
                                         isSyncing = false
 
-                                        // 重新检查未同步状态
                                         coroutineScope.launch {
-                                            unsyncedCounts = syncManager.checkUnsyncedConfigs()
+                                            refreshUnsyncedCounts()
                                         }
 
-                                        // 显示结果
                                         coroutineScope.launch {
                                             snackbarHostState.showSnackbar(message)
-
-                                            // 如果同步成功，额外显示详细信息
-                                            if (success) {
-                                                val counts = syncManager.checkUnsyncedConfigs()
-                                                val totalUnsynced = counts["总计"] ?: 0
-                                                if (totalUnsynced == 0) {
-                                                    Log.d("Config", "所有基础数据已同步完成")
-                                                } else {
-                                                    Log.d("Config", "还有 $totalUnsynced 条数据未同步")
-                                                }
-                                            }
                                         }
                                     }
                                 )
                             }
                         },
                         modifier = Modifier.weight(1f),
-                        enabled = !isSyncing && syncManager.isConnected()
+                        enabled = !isSyncing && !isFullPulling &&
+                            LengKuBaoApplication.getSyncManager().isConnected()
                     ) {
                         if (isSyncing) {
                             CircularProgressIndicator(
@@ -374,12 +471,89 @@ fun ScrollableConfigMainContent(
                             )
                         }
                         Spacer(modifier = Modifier.width(4.dp))
-                        Text(if (isSyncing) {
-                            if (syncType.isNotEmpty()) "syncType同步中..." else "同步中..."
-                        } else {
-                            "同步基础数据"
-                        })
+                        Text(if (isSyncing) "同步中..." else "双向增量同步")
                     }
+                }
+
+                Spacer(modifier = Modifier.height(8.dp))
+
+                OutlinedButton(
+                    onClick = { showFullPullDialog = true },
+                    modifier = Modifier.fillMaxWidth(),
+                    enabled = !isSyncing && !isFullPulling &&
+                        LengKuBaoApplication.getSyncManager().isConnected()
+                ) {
+                    if (isFullPulling) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(18.dp),
+                            strokeWidth = 2.dp,
+                        )
+                    } else {
+                        Icon(
+                            imageVector = Icons.Default.CloudDownload,
+                            contentDescription = null,
+                            modifier = Modifier.size(18.dp),
+                        )
+                    }
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text(if (isFullPulling) "全量拉取中..." else "从电脑全量拉取")
+                }
+
+                if (showFullPullDialog) {
+                    AlertDialog(
+                        onDismissRequest = { showFullPullDialog = false },
+                        title = { Text("从电脑全量拉取") },
+                        text = {
+                            Text(
+                                "将以电脑端数据为准，全量覆盖本地基础配置（客户/库位/经手人/型号/包装等）。" +
+                                    "本地未上传的改动会先尝试上传。删除/禁用以电脑为准。是否继续？",
+                            )
+                        },
+                        confirmButton = {
+                            TextButton(
+                                onClick = {
+                                    showFullPullDialog = false
+                                    coroutineScope.launch {
+                                        isFullPulling = true
+                                        syncResult = null
+                                        syncProgress = 0
+                                        syncTotal = 3
+                                        syncType = "全量拉取"
+
+                                        if (!LengKuBaoApplication.getSyncManager().isConnected()) {
+                                            syncResult = Pair(false, "未连接服务器，请先连接")
+                                            isFullPulling = false
+                                            snackbarHostState.showSnackbar("未连接服务器，请先连接")
+                                            return@launch
+                                        }
+
+                                        LengKuBaoApplication.getSyncManager().pullFullConfigFromPc(
+                                            onProgress = { current, total, type ->
+                                                syncProgress = current
+                                                syncTotal = total
+                                                syncType = type
+                                            },
+                                            onResult = { success, message ->
+                                                syncResult = Pair(success, message)
+                                                isFullPulling = false
+                                                coroutineScope.launch {
+                                                    refreshUnsyncedCounts()
+                                                    snackbarHostState.showSnackbar(message)
+                                                }
+                                            },
+                                        )
+                                    }
+                                },
+                            ) {
+                                Text("继续")
+                            }
+                        },
+                        dismissButton = {
+                            TextButton(onClick = { showFullPullDialog = false }) {
+                                Text("取消")
+                            }
+                        },
+                    )
                 }
             }
         }
@@ -387,6 +561,13 @@ fun ScrollableConfigMainContent(
         Spacer(modifier = Modifier.height(16.dp))
 
         // 配置项卡片
+        ConfigCard(
+            title = "客户管理",
+            description = "管理客户信息，新增、编辑和查看客户",
+            icon = Icons.Filled.People,
+            onClick = onCustomerManagementClick
+        )
+
         ConfigCard(
             title = "商品型号管理",
             description = "管理梨的型号，如42型、45型等",
@@ -423,17 +604,10 @@ fun ScrollableConfigMainContent(
         )
 
         ConfigCard(
-            title = "打印配置",
-            description = "配置打印机和企业信息",
-            icon = Icons.Filled.Print,
-            onClick = onPrintConfigClick
-        )
-
-        ConfigCard(
             title = "企业信息",
             description = "设置公司名称、地址、电话",
             icon = Icons.Filled.Business,
-            onClick = onPrintConfigClick
+            onClick = onCompanyInfoClick
         )
 
         ConfigCard(
@@ -466,7 +640,7 @@ fun ScrollableConfigMainContent(
 
         // 底部说明
         Text(
-            text = "提示：首次使用建议点击'同步基础数据'将本地数据上传到服务器",
+            text = "提示：日常同步用「双向增量同步」；数据不一致或重装恢复时用「从电脑全量拉取」",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             modifier = Modifier
@@ -521,6 +695,283 @@ fun ScrollableConfigMainContent(
                     Text("取消")
                 }
             }
+        )
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun FiscalYearManagementCard(
+    appContext: android.content.Context,
+    snackbarHostState: SnackbarHostState,
+    coroutineScope: CoroutineScope,
+    onYearChanged: () -> Unit,
+) {
+    var availableYears by remember { mutableStateOf(FiscalYearManager.listAvailableYears(appContext)) }
+    var selectedYear by remember { mutableIntStateOf(FiscalYearManager.activeYear) }
+    var expanded by remember { mutableStateOf(false) }
+    var showSwitchConfirm by remember { mutableStateOf<Int?>(null) }
+    var showSaveConfirm by remember { mutableStateOf(false) }
+    var showNewYearDialog by remember { mutableStateOf(false) }
+    var newYearInput by remember {
+        mutableStateOf(
+            (availableYears.maxOrNull()?.plus(1) ?: Calendar.getInstance().get(Calendar.YEAR)).toString()
+        )
+    }
+    var isBusy by remember { mutableStateOf(false) }
+
+    val activeDbName = FiscalYearManager.getActiveDbName()
+
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp, vertical = 8.dp),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.secondaryContainer
+        )
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(16.dp)
+        ) {
+            Text(
+                text = "年份管理",
+                style = MaterialTheme.typography.titleMedium,
+                color = MaterialTheme.colorScheme.onSecondaryContainer
+            )
+
+            Spacer(modifier = Modifier.height(8.dp))
+
+            Text(
+                text = "当前库：$activeDbName",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSecondaryContainer.copy(alpha = 0.8f)
+            )
+
+            Spacer(modifier = Modifier.height(12.dp))
+
+            ExposedDropdownMenuBox(
+                expanded = expanded,
+                onExpandedChange = { if (!isBusy) expanded = !expanded }
+            ) {
+                OutlinedTextField(
+                    value = selectedYear.toString(),
+                    onValueChange = {},
+                    readOnly = true,
+                    label = { Text("活跃年份") },
+                    trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expanded) },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .menuAnchor(),
+                    enabled = !isBusy
+                )
+                ExposedDropdownMenu(
+                    expanded = expanded,
+                    onDismissRequest = { expanded = false }
+                ) {
+                    availableYears.forEach { year ->
+                        DropdownMenuItem(
+                            text = { Text("$year 年") },
+                            onClick = {
+                                expanded = false
+                                if (year != FiscalYearManager.activeYear) {
+                                    showSwitchConfirm = year
+                                } else {
+                                    selectedYear = year
+                                }
+                            }
+                        )
+                    }
+                }
+            }
+
+            Spacer(modifier = Modifier.height(12.dp))
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                OutlinedButton(
+                    onClick = { showSaveConfirm = true },
+                    modifier = Modifier.weight(1f),
+                    enabled = !isBusy
+                ) {
+                    Icon(Icons.Default.Save, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text("保存年份")
+                }
+                Button(
+                    onClick = {
+                        newYearInput = (availableYears.maxOrNull()?.plus(1)
+                            ?: Calendar.getInstance().get(Calendar.YEAR)).toString()
+                        showNewYearDialog = true
+                    },
+                    modifier = Modifier.weight(1f),
+                    enabled = !isBusy
+                ) {
+                    Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text("新建年份")
+                }
+            }
+        }
+    }
+
+    showSwitchConfirm?.let { targetYear ->
+        AlertDialog(
+            onDismissRequest = { showSwitchConfirm = null },
+            title = { Text("切换年份") },
+            text = {
+                Text("切换到 $targetYear 年？切换后当前页面将关闭，请返回主页查看该年数据。")
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        showSwitchConfirm = null
+                        isBusy = true
+                        coroutineScope.launch {
+                            val result = withContext(Dispatchers.IO) {
+                                YearSwitchCoordinator.switchToYear(appContext, targetYear)
+                            }
+                            isBusy = false
+                            if (result.isSuccess) {
+                                selectedYear = targetYear
+                                availableYears = FiscalYearManager.listAvailableYears(appContext)
+                                snackbarHostState.showSnackbar("已切换到 $targetYear 年")
+                                onYearChanged()
+                            } else {
+                                snackbarHostState.showSnackbar("切换失败：${result.exceptionOrNull()?.message}")
+                            }
+                        }
+                    }
+                ) { Text("确定") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showSwitchConfirm = null }) { Text("取消") }
+            }
+        )
+    }
+
+    if (showSaveConfirm) {
+        AlertDialog(
+            onDismissRequest = { showSaveConfirm = false },
+            title = { Text("保存年份") },
+            text = {
+                Text("将当前 ${FiscalYearManager.activeYear} 年数据保存到 ${FiscalYearManager.getActiveDbName()}？")
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        showSaveConfirm = false
+                        isBusy = true
+                        coroutineScope.launch {
+                            val result = withContext(Dispatchers.IO) {
+                                YearSwitchCoordinator.saveCurrentYear(appContext)
+                            }
+                            isBusy = false
+                            if (result.isSuccess) {
+                                snackbarHostState.showSnackbar("年份数据已保存")
+                            } else {
+                                snackbarHostState.showSnackbar("保存失败：${result.exceptionOrNull()?.message}")
+                            }
+                        }
+                    }
+                ) { Text("确定") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showSaveConfirm = false }) { Text("取消") }
+            }
+        )
+    }
+
+    if (showNewYearDialog) {
+        AlertDialog(
+            onDismissRequest = { showNewYearDialog = false },
+            title = { Text("新建年份") },
+            text = {
+                Column {
+                    Text("从当前年复制基础资料（客户/型号/库位/经手人/包装），单据与库存为空。")
+                    Spacer(modifier = Modifier.height(8.dp))
+                    OutlinedTextField(
+                        value = newYearInput,
+                        onValueChange = { newYearInput = it.filter { ch -> ch.isDigit() }.take(4) },
+                        label = { Text("年份 (2000–2100)") },
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                        singleLine = true
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        val year = newYearInput.toIntOrNull()
+                        if (year == null || year !in 2000..2100) {
+                            coroutineScope.launch {
+                                snackbarHostState.showSnackbar("请输入 2000–2100 之间的有效年份")
+                            }
+                            return@TextButton
+                        }
+                        showNewYearDialog = false
+                        isBusy = true
+                        coroutineScope.launch {
+                            val result = withContext(Dispatchers.IO) {
+                                YearSwitchCoordinator.createNewYear(appContext, year)
+                            }
+                            isBusy = false
+                            if (result.isSuccess) {
+                                selectedYear = year
+                                availableYears = FiscalYearManager.listAvailableYears(appContext)
+                                snackbarHostState.showSnackbar("已新建并切换到 $year 年")
+                                onYearChanged()
+                            } else {
+                                snackbarHostState.showSnackbar("新建失败：${result.exceptionOrNull()?.message}")
+                            }
+                        }
+                    }
+                ) { Text("确定") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showNewYearDialog = false }) { Text("取消") }
+            }
+        )
+    }
+}
+
+@Composable
+private fun ConfigSyncCountRow(counts: Map<String, Int>, types: List<String>) {
+    Row(modifier = Modifier.fillMaxWidth()) {
+        types.forEach { type ->
+            Box(
+                modifier = Modifier.weight(1f),
+                contentAlignment = Alignment.Center,
+            ) {
+                ConfigSyncCountItem(
+                    label = type,
+                    count = counts[type] ?: 0,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun ConfigSyncCountItem(label: String, count: Int) {
+    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+        Text(
+            text = count.toString(),
+            style = MaterialTheme.typography.headlineSmall,
+            color = if (count > 0) {
+                MaterialTheme.colorScheme.error
+            } else {
+                MaterialTheme.colorScheme.onPrimaryContainer
+            },
+        )
+        Text(
+            text = label,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.7f),
+            textAlign = TextAlign.Center,
         )
     }
 }
